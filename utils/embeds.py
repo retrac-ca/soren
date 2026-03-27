@@ -77,18 +77,25 @@ def build_event_embed(event: dict, rsvps: dict) -> discord.Embed:
     def names_or_empty(names: list) -> str:
         return "\n".join(names) if names else "*None yet*"
 
+    # Use custom button labels as field headers if available
+    accept_label   = event.get("btn_accept_label")    or "✅ Accepted"
+    tentative_label = event.get("btn_tentative_label") or "❓ Tentative"
+    decline_label  = event.get("btn_decline_label")   or "❌ Declined"
+    show_tentative = bool(event.get("btn_tentative_enabled", 1))
+
     embed.add_field(
-        name=f"✅ Accepted ({len(accepted)})",
+        name=f"{accept_label} ({len(accepted)})",
         value=names_or_empty(accepted),
         inline=True,
     )
+    if show_tentative:
+        embed.add_field(
+            name=f"{tentative_label} ({len(tentative)})",
+            value=names_or_empty(tentative),
+            inline=True,
+        )
     embed.add_field(
-        name=f"❓ Tentative ({len(tentative)})",
-        value=names_or_empty(tentative),
-        inline=True,
-    )
-    embed.add_field(
-        name=f"❌ Declined ({len(declined)})",
+        name=f"{decline_label} ({len(declined)})",
         value=names_or_empty(declined),
         inline=True,
     )

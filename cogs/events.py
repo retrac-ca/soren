@@ -28,6 +28,9 @@ import pytz
 from utils.database import get_connection, is_premium
 from utils.permissions import is_event_creator, check_setup
 from utils.embeds import build_event_embed, build_error_embed, build_success_embed, COLOR_EVENT
+import logging
+
+log = logging.getLogger("soren.events")
 
 # ── Try to import relativedelta for monthly math ──────────────────────────────
 try:
@@ -147,8 +150,9 @@ class NewEventModal(discord.ui.Modal):
     """
     The main event creation form. Timezone has already been chosen via
     the TimezoneSelectView before this modal opens, so it's passed in
-    and shown as a read-only pre-filled field.
-    For 'custom' recurrence the last field is the repeat interval in days.
+    as a parameter. The last field is either repeat interval (custom
+    recurrence) or the Tentative button toggle (all other types).
+    Button label customization is available after creation via /eventbuttons.
     """
 
     def __init__(self, channel: discord.TextChannel, recur_rule: str,
@@ -255,23 +259,38 @@ class NewEventModal(discord.ui.Modal):
             event_id = cursor.lastrowid
             conn.commit()
 
+        show_tentative = 1  # Default: show tentative. Use /eventbuttons to toggle.
+
         event = {
             "id": event_id, "title": title, "description": description,
             "timezone": self.tz_name, "start_time": start_iso, "end_time": end_iso,
             "is_recurring": is_recurring, "recur_rule": self.recur_rule,
             "recur_interval": recur_interval, "channel_id": self.target_channel.id,
             "reminder_offset": 15,
+            "btn_accept_label":      "✅ Accept",
+            "btn_decline_label":     "❌ Decline",
+            "btn_tentative_label":   "❓ Tentative",
+            "btn_tentative_enabled": show_tentative,
         }
+
         await post_event_embed(self.target_channel, event)
 
         recur_str = RECUR_LABELS.get(self.recur_rule, self.recur_rule)
         if self.recur_rule == "custom":
             recur_str = f"Every {recur_interval} days"
 
+        log.info(
+            f"Event created: '{title}' (ID {event_id}) in guild "
+            f"{interaction.guild.id} by {interaction.user} "
+            f"— recur={self.recur_rule}, tz={self.tz_name}, tentative={bool(show_tentative)}"
+        )
+
         await interaction.response.send_message(
             embed=build_success_embed(
                 f"**{title}** created in {self.target_channel.mention}! "
-                f"(ID: `{event_id}` · {recur_str})"
+                f"(ID: `{event_id}` · {recur_str})
+"
+                f"Use `/eventbuttons` to customize button labels anytime."
             ),
             ephemeral=True,
         )
@@ -443,6 +462,54 @@ class EditEventModal(discord.ui.Modal):
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
 
 
+# ── /eventbuttons modal ──────────────────────────────────────────────────────
+class EventButtonsModal(discord.ui.Modal):
+    """
+    Opened by /eventbuttons. Lets the creator toggle the Tentative button
+    on an existing event. The embed refreshes immediately after saving.
+    Label customization is reserved for a future premium feature.
+    """
+
+    def __init__(self, event: dict, *args, **kwargs):
+        super().__init__(title=f"Button Settings: {event['title'][:35]}", *args, **kwargs)
+        self.event = event
+
+        current = "yes" if event.get("btn_tentative_enabled", 1) else "no"
+        self.add_item(discord.ui.InputText(
+            label="Show Tentative Button? (yes / no)",
+            value=current,
+            max_length=3,
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        from cogs.rsvp import refresh_event_embed
+
+        show_raw       = self.children[0].value.strip().lower()
+        show_tentative = 0 if show_raw in ("no", "n", "false", "0") else 1
+
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE events SET btn_tentative_enabled=? WHERE id=?",
+                (show_tentative, self.event["id"]),
+            )
+            conn.commit()
+
+        log.info(
+            f"Button config updated for event {self.event['id']} "
+            f"by {interaction.user} — show_tentative={bool(show_tentative)}"
+        )
+
+        state = "visible" if show_tentative else "hidden"
+        await interaction.response.send_message(
+            embed=build_success_embed(
+                f"Updated **{self.event['title']}** — "
+                f"Tentative button is now **{state}**."
+            ),
+            ephemeral=True,
+        )
+
+        await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 class Events(commands.Cog):
     """Core event management commands."""
@@ -608,6 +675,36 @@ class Events(commands.Cog):
             )
 
         await ctx.respond(embed=embed, ephemeral=True)
+
+
+    @discord.slash_command(name="eventbuttons", description="Customize the RSVP button labels for an event.")
+    async def eventbuttons(
+        self,
+        ctx: discord.ApplicationContext,
+        event_id: discord.Option(int, description="The event ID to customize.", required=True),
+    ):
+        """Opens a modal to set custom labels and toggle the Tentative button."""
+        if not is_event_creator(ctx.author):
+            await ctx.respond(
+                embed=build_error_embed("You need the **Event Creator** role to customize buttons."),
+                ephemeral=True,
+            )
+            return
+
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM events WHERE id=? AND guild_id=?",
+                (event_id, ctx.guild.id),
+            ).fetchone()
+
+        if not row:
+            await ctx.respond(
+                embed=build_error_embed(f"No event found with ID `{event_id}`."),
+                ephemeral=True,
+            )
+            return
+
+        await ctx.send_modal(EventButtonsModal(event=dict(row)))
 
 
 def setup(bot: discord.Bot):

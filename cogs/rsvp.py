@@ -5,7 +5,10 @@ Handles all button interactions on event embeds.
 
 Button layout on each event post
 ----------------------------------
-  [ ✅ Accept ]  [ ❓ Tentative ]  [ ❌ Decline ]  [ ✏️ Edit ]
+  [ <accept_label> ]  [ <tentative_label> ]  [ <decline_label> ]  [ ✏️ Edit ]
+
+  Tentative button is optional — hidden if btn_tentative_enabled=0.
+  Button labels are fully customizable per event.
 
 RSVP buttons — available to everyone:
   Clicking a button upserts the user's RSVP row and refreshes the embed.
@@ -23,10 +26,18 @@ from discord.ext import commands
 from utils.database import get_connection, is_premium
 from utils.permissions import is_event_creator
 from utils.embeds import build_event_embed
+import logging
+
+log = logging.getLogger("soren.rsvp")
 
 
 # ── Free tier display cap ─────────────────────────────────────────────────────
 FREE_RSVP_DISPLAY_LIMIT = 50
+
+# ── Button label defaults ─────────────────────────────────────────────────────
+DEFAULT_ACCEPT_LABEL    = "✅ Accept"
+DEFAULT_TENTATIVE_LABEL = "❓ Tentative"
+DEFAULT_DECLINE_LABEL   = "❌ Decline"
 
 
 # ── Database helpers ──────────────────────────────────────────────────────────
@@ -57,7 +68,6 @@ def fetch_rsvps_for_embed(event_id: int, guild: discord.Guild, premium: bool) ->
         user_id = row["user_id"]
         counts[status] += 1
 
-        # Skip rendering if we've hit the free tier cap
         limit = None if premium else FREE_RSVP_DISPLAY_LIMIT
         if limit and len(result[status]) >= limit:
             continue
@@ -66,7 +76,6 @@ def fetch_rsvps_for_embed(event_id: int, guild: discord.Guild, premium: bool) ->
         name   = member.display_name if member else f"<User {user_id}>"
         result[status].append(name)
 
-    # Show overflow notice for free tier
     if not premium:
         for status in result:
             overflow = counts[status] - len(result[status])
@@ -96,57 +105,123 @@ async def refresh_event_embed(event_id: int, guild: discord.Guild, bot: discord.
         channel = guild.get_channel(event["channel_id"])
         if channel and event.get("message_id"):
             msg  = await channel.fetch_message(event["message_id"])
-            view = EventView(event_id=event_id)
+            view = EventView(event_id=event_id, event=event)
             await msg.edit(embed=embed, view=view)
-    except (discord.NotFound, discord.Forbidden):
-        pass   # Message gone or no permission — not critical
+    except discord.NotFound:
+        log.warning(f"refresh_event_embed: message not found for event {event_id}")
+    except discord.Forbidden:
+        log.warning(f"refresh_event_embed: no permission to edit message for event {event_id}")
+    except Exception as e:
+        log.error(f"refresh_event_embed: unexpected error for event {event_id}: {e}")
 
 
-# ── Main button view attached to every event embed ────────────────────────────
+# ── Dynamic event view ────────────────────────────────────────────────────────
 class EventView(discord.ui.View):
     """
-    Persistent view with four buttons:
-      ✅ Accept  |  ❓ Tentative  |  ❌ Decline  |  ✏️ Edit
+    Persistent view with up to four buttons:
+      <accept>  |  <tentative> (optional)  |  <decline>  |  ✏️ Edit
 
-    timeout=None keeps buttons active indefinitely (across bot restarts
-    once the view is re-registered in on_ready).
+    Button labels and tentative visibility are read from the event record.
+    timeout=None keeps buttons active indefinitely across bot restarts.
     """
 
-    def __init__(self, event_id: int):
+    def __init__(self, event_id: int, event: dict | None = None):
         super().__init__(timeout=None)
         self.event_id = event_id
-        # Encode event_id into each button's custom_id so interactions
-        # still work correctly after a bot restart.
-        for child in self.children:
-            child.custom_id = f"{child.custom_id}:{event_id}"
 
-    # ── RSVP buttons ─────────────────────────────────────────────────────
+        # Read config from event dict (fall back to defaults if not provided)
+        accept_label    = DEFAULT_ACCEPT_LABEL
+        tentative_label = DEFAULT_TENTATIVE_LABEL
+        decline_label   = DEFAULT_DECLINE_LABEL
+        show_tentative  = True
 
-    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success,
-                       custom_id="rsvp_accept")
-    async def accept(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await self._handle_rsvp(interaction, "accepted")
+        if event:
+            accept_label    = event.get("btn_accept_label")    or DEFAULT_ACCEPT_LABEL
+            tentative_label = event.get("btn_tentative_label") or DEFAULT_TENTATIVE_LABEL
+            decline_label   = event.get("btn_decline_label")   or DEFAULT_DECLINE_LABEL
+            show_tentative  = bool(event.get("btn_tentative_enabled", 1))
 
-    @discord.ui.button(label="❓ Tentative", style=discord.ButtonStyle.secondary,
-                       custom_id="rsvp_tentative")
-    async def tentative(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await self._handle_rsvp(interaction, "tentative")
+        # ── Accept button ─────────────────────────────────────────────────
+        accept_btn = discord.ui.Button(
+            label=accept_label,
+            style=discord.ButtonStyle.success,
+            custom_id=f"rsvp_accept:{event_id}",
+        )
+        accept_btn.callback = self._make_rsvp_callback("accepted")
+        self.add_item(accept_btn)
 
-    @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.danger,
-                       custom_id="rsvp_decline")
-    async def decline(self, button: discord.ui.Button, interaction: discord.Interaction):
-        await self._handle_rsvp(interaction, "declined")
+        # ── Tentative button (optional) ───────────────────────────────────
+        if show_tentative:
+            tentative_btn = discord.ui.Button(
+                label=tentative_label,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"rsvp_tentative:{event_id}",
+            )
+            tentative_btn.callback = self._make_rsvp_callback("tentative")
+            self.add_item(tentative_btn)
 
-    # ── Edit button ──────────────────────────────────────────────────────
+        # ── Decline button ────────────────────────────────────────────────
+        decline_btn = discord.ui.Button(
+            label=decline_label,
+            style=discord.ButtonStyle.danger,
+            custom_id=f"rsvp_decline:{event_id}",
+        )
+        decline_btn.callback = self._make_rsvp_callback("declined")
+        self.add_item(decline_btn)
 
-    @discord.ui.button(label="✏️ Edit", style=discord.ButtonStyle.primary,
-                       custom_id="event_edit")
-    async def edit_event(self, button: discord.ui.Button, interaction: discord.Interaction):
-        """
-        Opens the EditEventModal pre-filled with this event's current data.
-        Only available to members with the Event Creator role or server admins.
-        """
-        # Permission check — only event creators / admins can edit
+        # ── Edit button (always shown, role-restricted) ───────────────────
+        edit_btn = discord.ui.Button(
+            label="✏️ Edit",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"event_edit:{event_id}",
+        )
+        edit_btn.callback = self._edit_callback
+        self.add_item(edit_btn)
+
+    def _make_rsvp_callback(self, status: str):
+        """Returns an async callback bound to the given RSVP status."""
+        async def callback(interaction: discord.Interaction):
+            event = fetch_event(self.event_id)
+            if not event:
+                await interaction.response.send_message(
+                    "This event no longer exists.", ephemeral=True
+                )
+                return
+
+            with get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO rsvps (event_id, user_id, status, updated_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    ON CONFLICT(event_id, user_id) DO UPDATE
+                    SET status=excluded.status, updated_at=excluded.updated_at
+                    """,
+                    (self.event_id, interaction.user.id, status),
+                )
+                conn.commit()
+
+            log.info(
+                f"RSVP: {interaction.user} set status='{status}' "
+                f"on event {self.event_id} in guild {interaction.guild_id}"
+            )
+
+            # Use the custom label for the confirmation message
+            label_map = {
+                "accepted":  event.get("btn_accept_label")    or DEFAULT_ACCEPT_LABEL,
+                "declined":  event.get("btn_decline_label")   or DEFAULT_DECLINE_LABEL,
+                "tentative": event.get("btn_tentative_label") or DEFAULT_TENTATIVE_LABEL,
+            }
+            await interaction.response.send_message(
+                f"Your RSVP for **{event['title']}** has been set to **{label_map[status]}**.",
+                ephemeral=True,
+            )
+
+            await refresh_event_embed(self.event_id, interaction.guild, interaction.client)
+
+        return callback
+
+    async def _edit_callback(self, interaction: discord.Interaction):
+        """Opens the EditEventModal. Restricted to Event Creator role / admins."""
         if not is_event_creator(interaction.user):
             await interaction.response.send_message(
                 "❌ You need the **Event Creator** role to edit events.",
@@ -154,7 +229,6 @@ class EventView(discord.ui.View):
             )
             return
 
-        # Fetch the latest event data to pre-fill the modal
         event = fetch_event(self.event_id)
         if not event:
             await interaction.response.send_message(
@@ -162,47 +236,8 @@ class EventView(discord.ui.View):
             )
             return
 
-        # Import here to avoid circular import at module level
         from cogs.events import EditEventModal
         await interaction.response.send_modal(EditEventModal(event=event))
-
-    # ── Shared RSVP handler ──────────────────────────────────────────────
-
-    async def _handle_rsvp(self, interaction: discord.Interaction, status: str):
-        """Upsert the user's RSVP and refresh the embed."""
-        event = fetch_event(self.event_id)
-        if not event:
-            await interaction.response.send_message(
-                "This event no longer exists.", ephemeral=True
-            )
-            return
-
-        # Upsert: insert or update this user's RSVP row
-        with get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO rsvps (event_id, user_id, status, updated_at)
-                VALUES (?, ?, ?, datetime('now'))
-                ON CONFLICT(event_id, user_id) DO UPDATE
-                SET status=excluded.status, updated_at=excluded.updated_at
-                """,
-                (self.event_id, interaction.user.id, status),
-            )
-            conn.commit()
-
-        # Respond immediately (Discord requires a response within 3 seconds)
-        label_map = {
-            "accepted":  "✅ Accepted",
-            "declined":  "❌ Declined",
-            "tentative": "❓ Tentative",
-        }
-        await interaction.response.send_message(
-            f"Your RSVP for **{event['title']}** has been set to **{label_map[status]}**.",
-            ephemeral=True,
-        )
-
-        # Refresh the public embed
-        await refresh_event_embed(self.event_id, interaction.guild, interaction.client)
 
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
@@ -216,8 +251,9 @@ class RSVP(commands.Cog):
     async def on_ready(self):
         """
         Re-register the persistent view every time the bot starts.
-        Without this, the buttons stop responding after a restart.
-        We register with event_id=0 — the custom_id prefix is what matters.
+        Without this, buttons stop responding after a restart.
+        We register with event_id=0 and no event dict — the custom_id
+        prefix is what Discord uses to route interactions.
         """
         self.bot.add_view(EventView(event_id=0))
 

@@ -67,11 +67,27 @@ def init_db():
             parent_event_id INTEGER,
             reminder_offset INTEGER DEFAULT 15,
             notify_role_id  INTEGER,
-            gcal_event_id   TEXT,
-            created_at      TEXT    DEFAULT (datetime('now')),
+            gcal_event_id         TEXT,
+            btn_accept_label      TEXT    DEFAULT '✅ Accept',
+            btn_tentative_label   TEXT    DEFAULT '❓ Tentative',
+            btn_decline_label     TEXT    DEFAULT '❌ Decline',
+            btn_tentative_enabled INTEGER DEFAULT 1,
+            created_at            TEXT    DEFAULT (datetime('now')),
             FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id)
         )
     """)
+
+    # ── Migration: add button columns to existing databases ──────────────
+    for col, definition in [
+        ("btn_accept_label",      "TEXT DEFAULT '✅ Accept'"),
+        ("btn_tentative_label",   "TEXT DEFAULT '❓ Tentative'"),
+        ("btn_decline_label",     "TEXT DEFAULT '❌ Decline'"),
+        ("btn_tentative_enabled", "INTEGER DEFAULT 1"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
+        except Exception:
+            pass  # Column already exists
 
     # ── RSVPs ────────────────────────────────────────────────────────────
     cursor.execute("""
