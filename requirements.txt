@@ -1,0 +1,19 @@
+# Soren Bot — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Discord library (py-cord — supports slash commands natively)
+py-cord>=2.6.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# Timezone support
+pytz>=2024.1
+
+# Accurate date math for monthly/bi-monthly recurring events
+python-dateutil>=2.9.0
+
+# Google Calendar integration (optional — comment out if not using)
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.126.0
