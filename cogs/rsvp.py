@@ -97,6 +97,11 @@ async def refresh_event_embed(event_id: int, guild: discord.Guild, bot: discord.
     if not event:
         return
 
+    # Attach guild embed color
+    from utils.database import get_guild_config
+    cfg = get_guild_config(guild.id)
+    event = {**event, "embed_color": cfg.get("embed_color") if cfg else None}
+
     premium = is_premium(guild.id)
     rsvps   = fetch_rsvps_for_embed(event_id, guild, premium)
     embed   = build_event_embed(event, rsvps)

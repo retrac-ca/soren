@@ -68,6 +68,8 @@ def init_db():
             reminder_offset INTEGER DEFAULT 15,
             notify_role_id  INTEGER,
             gcal_event_id         TEXT,
+            reminded_at           TEXT,
+            embed_color           TEXT    DEFAULT '5865F2',
             btn_accept_label      TEXT    DEFAULT '✅ Accept',
             btn_tentative_label   TEXT    DEFAULT '❓ Tentative',
             btn_decline_label     TEXT    DEFAULT '❌ Decline',
@@ -83,6 +85,8 @@ def init_db():
         ("btn_tentative_label",   "TEXT DEFAULT '❓ Tentative'"),
         ("btn_decline_label",     "TEXT DEFAULT '❌ Decline'"),
         ("btn_tentative_enabled", "INTEGER DEFAULT 1"),
+        ("reminded_at",           "TEXT"),
+        ("embed_color",           "TEXT DEFAULT '5865F2'"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
@@ -124,6 +128,18 @@ def init_db():
             active          INTEGER DEFAULT 1,  -- 1 = enabled, 0 = paused
             created_at      TEXT    DEFAULT (datetime('now')),
             FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id)
+        )
+    """)
+
+    # ── Redeemed premium codes ───────────────────────────────────────────
+    # Tracks which codes have already been redeemed so they can't be reused.
+    # The valid code list lives in premium_keys.txt, not here.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS redeemed_codes (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            code            TEXT    NOT NULL UNIQUE,
+            used_by_guild   INTEGER NOT NULL,
+            used_at         TEXT    DEFAULT (datetime('now'))
         )
     """)
 

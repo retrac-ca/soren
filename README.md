@@ -2,6 +2,10 @@
 
 Soren is a self-hosted Discord bot for creating and managing events with RSVP signups, recurring schedules, pre-event reminders, and optional Google Calendar sync. Designed for clans, guilds, and communities who want full ownership of their events inside Discord.
 
+**Creator:** Toadle  
+**Support:** https://soren.retrac.ca  
+**Version:** 1.2
+
 ---
 
 ## ✨ Features
@@ -15,6 +19,7 @@ Soren is a self-hosted Discord bot for creating and managing events with RSVP si
 | Pre-event reminders (configurable) | ✅ | ✅ |
 | Google Calendar sync (/gcal) | ✅ | ✅ |
 | G-Cal Integrations (multi-calendar summaries) | ✅ | ✅ |
+| Embed colors | 3 (Blue, Red, Green) | 8 colors |
 
 ---
 
@@ -28,20 +33,22 @@ soren/
 ├── .env                        # Your secrets (never commit this)
 ├── .gitignore
 ├── google_credentials.json     # Google OAuth credentials (never commit this)
+├── premium_keys.txt            # Premium redemption codes (never commit this)
 │
 ├── cogs/
-│   ├── setup.py                # /setup, /config, /setpremium
-│   ├── events.py               # /newevent, /editevent, /deleteevent, /listevents
+│   ├── setup.py                # /setup, /config, /embedcolor
+│   ├── events.py               # /newevent, /editevent, /deleteevent, /listevents, /eventbuttons
 │   ├── rsvp.py                 # RSVP buttons and embed refresh logic
 │   ├── reminders.py            # Background reminder loop
 │   ├── google_cal.py           # Primary Google Calendar sync (/gcal)
 │   ├── gcal_integrations.py    # Multi-calendar weekly summaries (/gcalint)
-│   └── premium.py              # /premium, /help
+│   ├── premium.py              # /premiumcode, /premium, /help
+│   └── ping.py                 # /ping — bot status and latency
 │
 ├── utils/
 │   ├── database.py             # SQLite setup, schema, and query helpers
-│   ├── embeds.py               # Discord embed builders
-│   └── permissions.py         # Event creator role checks
+│   ├── embeds.py               # Discord embed builders and color constants
+│   └── permissions.py          # Event creator role checks
 │
 └── data/
     └── soren.db                # SQLite database (gitignored)
@@ -57,7 +64,7 @@ soren/
 
 ### Step 1 — Clone the repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/soren.git
+git clone https://github.com/retrac-ca/soren.git
 cd soren
 ```
 
@@ -99,19 +106,27 @@ python bot.py
 
 ## ⚙️ First-Time Server Setup
 
-1. Run `/setup` as a server administrator
-2. Select the **Event Creator role**
+1. Run `/setup` as a server administrator and select the **Event Creator role**
+2. Run `/embedcolor` to choose your server's embed color (optional)
 3. Done — use `/help` to see all commands
 
 ---
 
 ## 📅 Creating an Event
 
-Run `/newevent #channel`. The flow has **3 steps:**
+Run `/newevent #channel`. The flow has **4 steps:**
 
 1. **Choose event type** — Single, Daily, Weekly, Bi-Weekly, Bi-Monthly, Monthly, or Custom
 2. **Choose timezone** — Dropdown of North American timezones + UTC
-3. **Fill in the details** — Title, description, start/end time
+3. **Choose reminder timing** — 15 min, 30 min, 45 min, 1 hour, 2 hours, or Custom
+4. **Fill in the details** — Title, description, start/end time, notify role (optional)
+
+### Date & Time Formats Accepted
+The start and end time fields accept flexible input:
+- `2026-07-04 20:00` — strict format
+- `July 4 8pm` — natural language
+- `next Friday 9pm` — relative dates
+- `Apr 2 7:30pm` — abbreviated month
 
 ### Timezone Options
 
@@ -127,6 +142,23 @@ Run `/newevent #channel`. The flow has **3 steps:**
 | Atlantic Time (AT) | America/Halifax | UTC-4 / UTC-3 DST |
 | Newfoundland Time (NT) | America/St_Johns | UTC-3:30 / UTC-2:30 DST |
 | UTC | UTC | Coordinated Universal Time |
+
+---
+
+## 🎨 Embed Colors
+
+Run `/embedcolor` to choose the color of event embeds for your server.
+
+| Color | Free | Premium |
+|---|---|---|
+| Blue (default) | ✅ | ✅ |
+| Red | ✅ | ✅ |
+| Green | ✅ | ✅ |
+| Gold | ❌ | ✅ |
+| Purple | ❌ | ✅ |
+| Cyan | ❌ | ✅ |
+| Orange | ❌ | ✅ |
+| Brown | ❌ | ✅ |
 
 ---
 
@@ -147,14 +179,13 @@ Run `/newevent #channel`. The flow has **3 steps:**
 
 ### G-Cal Integrations (`/gcalint`) — Multi-calendar summaries
 
-Connect multiple Google Calendars, each auto-posting weekly digests to a Discord channel.
+Connect multiple Google Calendars, each auto-posting weekly digests to a Discord channel. Summaries show up to 8 events per page with ◀ ▶ navigation buttons.
 
 **Setup flow:**
 1. `/gcalint add` → choose schedule → choose day (weekly) → fill in label/channel/hour
 2. Click the auth link → authorize with Google → browser shows "This site can't be reached" (normal!)
 3. Copy the `code=` value from the URL bar: `http://localhost/?code=COPY_THIS&scope=...`
 4. `/gcalint verify <code>` → a **calendar picker** appears — choose which calendar to connect
-5. Done!
 
 | Command | Description |
 |---|---|
@@ -167,7 +198,7 @@ Connect multiple Google Calendars, each auto-posting weekly digests to a Discord
 
 ---
 
-### Primary Sync (`/gcal`) — Single calendar, two-way
+### Primary Sync (`/gcal`) — Single calendar
 
 | Command | Description |
 |---|---|
@@ -175,22 +206,49 @@ Connect multiple Google Calendars, each auto-posting weekly digests to a Discord
 | `/gcal verify <code>` | Complete auth |
 | `/gcal disconnect` | Remove the connection |
 
-Events from `/newevent` are pushed to Google Calendar. New Google Calendar events are pulled into Discord every 15 minutes (no RSVP buttons).
-
 ---
 
 ## 🔔 Reminders
 
-Soren sends reminders **15 minutes before** each event by default. Change the offset via the ✏️ Edit button or `/editevent`. Reminders ping the notify role and all Accepted/Tentative RSVPers.
+Reminders fire at your chosen time before each event. The offset is set during `/newevent` and can be changed via the ✏️ Edit button or `/editevent`. Reminders ping the configured notify role and all Accepted/Tentative RSVPers. Reminder state is tracked in the database so reminders survive bot restarts and are never sent twice.
 
 ---
 
 ## 💎 Premium
 
-Free servers: **5 events max**, **50 RSVP names shown**. Bot owner enables premium with:
-```
-/setpremium enabled:True
-```
+Free servers: **5 events max**, **50 RSVP names shown**, **3 embed colors**.
+
+To activate premium, a server admin runs `/premiumcode <code>` with a valid code.
+
+Premium codes are managed in `premium_keys.txt` — one code per line. This file is gitignored and should never be committed.
+
+---
+
+## 🔧 Bot Commands — Full Reference
+
+| Command | Who | Description |
+|---|---|---|
+| `/ping` | Everyone | Bot status, latency, uptime, and info |
+| `/help` | Everyone | Full command list |
+| `/premium` | Everyone | Free vs Premium comparison |
+| `/premiumcode` | Admins | Redeem a premium code |
+| `/setup` | Admins | First-time server configuration |
+| `/config` | Admins | View current settings |
+| `/embedcolor` | Admins | Choose event embed color |
+| `/newevent` | Event Creator | Create a new event |
+| `/editevent` | Event Creator | Edit an event by ID |
+| `/deleteevent` | Event Creator | Delete an event |
+| `/listevents` | Everyone | View upcoming events |
+| `/eventbuttons` | Event Creator | Toggle Tentative button on an event |
+| `/gcal connect` | Admins | Connect primary Google Calendar |
+| `/gcal verify` | Admins | Complete primary Google Calendar auth |
+| `/gcal disconnect` | Admins | Remove primary calendar link |
+| `/gcalint add` | Admins | Connect a calendar for auto-summaries |
+| `/gcalint verify` | Admins | Complete auth + pick which calendar |
+| `/gcalint list` | Admins | List all connected calendars |
+| `/gcalint remove` | Admins | Disconnect a calendar |
+| `/gcalint pause` | Admins | Pause/resume a calendar |
+| `/gcalint post` | Admins | Manually post a summary now |
 
 ---
 
@@ -221,31 +279,6 @@ sudo systemctl enable soren && sudo systemctl start soren
 
 ---
 
-## 📋 Full Command Reference
-
-| Command | Who | Description |
-|---|---|---|
-| `/setup` | Admins | First-time server configuration |
-| `/config` | Admins | View current settings |
-| `/setpremium` | Bot owner | Toggle premium for a server |
-| `/newevent` | Event Creator | Create a new event |
-| `/editevent` | Event Creator | Edit an event by ID |
-| `/deleteevent` | Event Creator | Delete an event |
-| `/listevents` | Everyone | View upcoming events |
-| `/gcal connect` | Admins | Connect primary Google Calendar |
-| `/gcal verify` | Admins | Complete primary Google Calendar auth |
-| `/gcal disconnect` | Admins | Remove primary calendar link |
-| `/gcalint add` | Admins | Connect a calendar for auto-summaries |
-| `/gcalint verify` | Admins | Complete auth + pick which calendar |
-| `/gcalint list` | Admins | List all connected calendars |
-| `/gcalint remove` | Admins | Disconnect a calendar |
-| `/gcalint pause` | Admins | Pause/resume a calendar |
-| `/gcalint post` | Admins | Manually post a summary now |
-| `/premium` | Everyone | Free vs Premium comparison |
-| `/help` | Everyone | Full command list |
-
----
-
 ## 🛠️ Development Notes
 
 - **Language:** Python 3.10+
@@ -253,6 +286,7 @@ sudo systemctl enable soren && sudo systemctl start soren
 - **Database:** SQLite — one `soren.db` per deployment, all data scoped by `guild_id`
 - **Multi-server safe:** Designed to run on many servers simultaneously
 - **Architecture:** Cog-based — each feature in its own file under `cogs/`
+- **Date parsing:** Uses `dateparser` for flexible natural language date input
 
 ---
 
@@ -261,8 +295,9 @@ sudo systemctl enable soren && sudo systemctl start soren
 Never commit these files:
 - `.env` — Discord bot token
 - `google_credentials.json` — Google OAuth client secret
+- `premium_keys.txt` — Premium redemption codes
 
-Both are in `.gitignore` already.
+All three are in `.gitignore` already.
 
 ---
 

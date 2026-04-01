@@ -8,42 +8,43 @@ import discord
 from discord.ext import commands
 import os
 import logging
+import asyncio
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from utils.database import init_db
 
-# ── Load environment variables from .env file ──────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# ── Logging setup ───────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("soren")
 
-# ── Bot setup ───────────────────────────────────────────────────────────────
-# We use discord.Bot (Pycord) for native slash command support
 intents = discord.Intents.default()
-intents.members = True   # Needed to look up member display names
+intents.members = True
 
 bot = discord.Bot(intents=intents)
 
-# ── List of cog modules to load ─────────────────────────────────────────────
 COGS = [
-    "cogs.setup",       # Server setup / configuration
-    "cogs.events",      # Event creation, editing, deletion
-    "cogs.rsvp",        # RSVP / signup handling
-    "cogs.reminders",   # Scheduled reminders
-    "cogs.google_cal",  # Google Calendar sync
-    "cogs.gcal_integrations",  # G-Cal Integrations — multi-calendar weekly summaries
-    "cogs.premium",            # Premium tier checks
+    "cogs.setup",
+    "cogs.events",
+    "cogs.rsvp",
+    "cogs.reminders",
+    "cogs.google_cal",
+    "cogs.gcal_integrations",
+    "cogs.premium",
+    "cogs.ping",
 ]
+
 
 @bot.event
 async def on_ready():
     """Fires when the bot has connected to Discord."""
+    bot.start_time = datetime.now(timezone.utc)
     log.info(f"Soren is online as {bot.user} (ID: {bot.user.id})")
+
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
@@ -51,18 +52,26 @@ async def on_ready():
         )
     )
 
+    asyncio.create_task(_sync_commands())
+
+
+async def _sync_commands():
+    """Sync slash commands after a short delay to let the gateway settle."""
+    await asyncio.sleep(3)
+    try:
+        await bot.sync_commands()
+        log.info("Slash commands synced successfully.")
+    except Exception as e:
+        log.error(f"Failed to sync slash commands: {e}")
+
+
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    """
-    Fires when Soren joins a new server.
-    Sends a welcome message prompting the admin to run /setup.
-    """
+    """Fires when Soren joins a new server."""
     log.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
 
-    # Try to find the best channel to send a welcome message
     channel = guild.system_channel
     if channel is None:
-        # Fall back to the first text channel we can write in
         for ch in guild.text_channels:
             if ch.permissions_for(guild.me).send_messages:
                 channel = ch
@@ -92,11 +101,10 @@ async def load_cogs():
             log.error(f"Failed to load cog {cog}: {e}")
 
 
-# ── Start ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Initialise the SQLite database (creates tables if they don't exist)
     init_db()
-    # Load all feature cogs
-    import asyncio
-    asyncio.run(load_cogs())  # Pycord supports top-level async load
-    bot.run(TOKEN)
+    asyncio.run(load_cogs())
+    try:
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        log.info("Soren shut down via Ctrl+C.")
