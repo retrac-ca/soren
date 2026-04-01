@@ -11,18 +11,44 @@ Reminders go out `reminder_offset` minutes before the event starts
 
 Reminders are tracked in the DB (reminded_at column) so they survive
 bot restarts and are never sent twice.
+
+After a recurring event fires its reminder, the start_time is advanced
+to the next occurrence and a fresh embed is posted in the channel.
 """
 
 import discord
 from discord.ext import commands, tasks
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
+import json
 import logging
 
 from utils.database import get_connection
 from utils.embeds import build_reminder_embed
+from cogs.events import compute_next_start, repost_recurring_embed
 
 log = logging.getLogger("soren.reminders")
+
+
+def _try_refresh_token(token_json: str, creds_file: str) -> str | None:
+    """
+    Attempt to refresh an expired Google OAuth token.
+    Returns updated token JSON string on success, None on failure.
+    """
+    try:
+        import google.auth.transport.requests
+        from google.oauth2.credentials import Credentials
+
+        creds = Credentials.from_authorized_user_info(json.loads(token_json))
+        if creds.expired and creds.refresh_token:
+            request = google.auth.transport.requests.Request()
+            creds.refresh(request)
+            log.info("OAuth token refreshed successfully.")
+            return creds.to_json()
+        return token_json  # Not expired, return as-is
+    except Exception as e:
+        log.error(f"Failed to refresh OAuth token: {e}")
+        return None
 
 
 class Reminders(commands.Cog):
@@ -31,10 +57,13 @@ class Reminders(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
         self.reminder_loop.start()
+        self.token_refresh_loop.start()
 
     def cog_unload(self):
         self.reminder_loop.cancel()
+        self.token_refresh_loop.cancel()
 
+    # ── Reminder loop ─────────────────────────────────────────────────────
     @tasks.loop(minutes=1)
     async def reminder_loop(self):
         """
@@ -44,16 +73,18 @@ class Reminders(commands.Cog):
         Uses a 5-minute lookback window so missed reminders still fire
         if the bot was briefly offline.
         """
-        now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+        now_utc     = datetime.now(timezone.utc).replace(tzinfo=pytz.utc)
+        now_minus_5 = now_utc - timedelta(minutes=5)
+        now_plus_2h = now_utc + timedelta(hours=2)
 
         with get_connection() as conn:
-            # Only fetch events that haven't been reminded yet
             events = conn.execute(
-                "SELECT * FROM events WHERE reminded_at IS NULL"
+                "SELECT * FROM events WHERE reminded_at IS NULL AND start_time BETWEEN ? AND ?",
+                (now_minus_5.isoformat(), now_plus_2h.isoformat()),
             ).fetchall()
 
         for row in events:
-            event = dict(row)
+            event    = dict(row)
             event_id = event["id"]
 
             try:
@@ -64,15 +95,13 @@ class Reminders(commands.Cog):
                 continue
 
             offset_minutes = event.get("reminder_offset") or 15
-            remind_at = start_dt - timedelta(minutes=offset_minutes)
+            remind_at      = start_dt - timedelta(minutes=offset_minutes)
 
-            # Fire if we're within a 5-minute window of the reminder time
-            # (5 min lookback handles brief bot downtime / missed 1-min ticks)
             diff = (now_utc - remind_at).total_seconds()
             if not (-60 <= diff <= 300):
-                continue  # Not time yet, or more than 5 minutes past
+                continue
 
-            # Mark as reminded in DB immediately to prevent double-sends
+            # Mark as reminded immediately to prevent double-sends
             with get_connection() as conn:
                 conn.execute(
                     "UPDATE events SET reminded_at=? WHERE id=?",
@@ -82,6 +111,23 @@ class Reminders(commands.Cog):
 
             log.info(f"Sending reminder for event {event_id}: {event['title']}")
             await self._send_reminder(event)
+
+            # Advance recurring events and repost embed
+            if event.get("is_recurring") and event.get("recur_rule"):
+                next_start = compute_next_start(
+                    event["start_time"], event["recur_rule"], event.get("recur_interval", 1)
+                )
+                if next_start:
+                    with get_connection() as conn:
+                        conn.execute(
+                            "UPDATE events SET start_time=?, reminded_at=NULL WHERE id=?",
+                            (next_start, event_id),
+                        )
+                        conn.commit()
+                    log.info(f"Advanced recurring event {event_id} to next occurrence: {next_start}")
+                    await repost_recurring_embed(self.bot, event_id)
+                else:
+                    log.info(f"No more occurrences for recurring event {event_id}")
 
     @reminder_loop.before_loop
     async def before_reminder_loop(self):
@@ -94,8 +140,7 @@ class Reminders(commands.Cog):
             log.warning(f"Reminder: channel {event['channel_id']} not found for event {event['id']}")
             return
 
-        embed = build_reminder_embed(event)
-
+        embed      = build_reminder_embed(event)
         ping_parts = []
 
         if event.get("notify_role_id"):
@@ -122,7 +167,65 @@ class Reminders(commands.Cog):
             await channel.send(content=ping_str or None, embed=embed)
             log.info(f"Reminder sent for event {event['id']} ({event['title']})")
         except discord.Forbidden:
-            log.warning(f"No permission to send reminder in channel {channel.id}")
+            log.warning(
+                f"Reminder: no permission to send in channel {channel.id} "
+                f"(guild {channel.guild.id}) for event {event['id']}"
+            )
+        except Exception as e:
+            log.error(f"Reminder: unexpected error sending for event {event['id']}: {e}")
+
+    # ── OAuth token refresh loop ──────────────────────────────────────────
+    @tasks.loop(hours=1)
+    async def token_refresh_loop(self):
+        """
+        Runs every hour. Proactively refreshes Google OAuth tokens for
+        both guild_config (primary /gcal sync) and gcal_integrations
+        before they expire, preventing silent failures on the next post.
+        """
+        import os
+        creds_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
+
+        # ── Refresh primary gcal tokens ───────────────────────────────────
+        with get_connection() as conn:
+            guilds = conn.execute(
+                "SELECT guild_id, gcal_token FROM guild_config WHERE gcal_token IS NOT NULL"
+            ).fetchall()
+
+        for row in guilds:
+            new_token = _try_refresh_token(row["gcal_token"], creds_file)
+            if new_token and new_token != row["gcal_token"]:
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE guild_config SET gcal_token=? WHERE guild_id=?",
+                        (new_token, row["guild_id"]),
+                    )
+                    conn.commit()
+                log.info(f"Refreshed primary gcal token for guild {row['guild_id']}")
+            elif new_token is None:
+                log.warning(f"Could not refresh primary gcal token for guild {row['guild_id']} — integration may fail")
+
+        # ── Refresh gcal_integrations tokens ──────────────────────────────
+        with get_connection() as conn:
+            integrations = conn.execute(
+                "SELECT id, guild_id, gcal_token FROM gcal_integrations WHERE active=1"
+            ).fetchall()
+
+        for row in integrations:
+            new_token = _try_refresh_token(row["gcal_token"], creds_file)
+            if new_token and new_token != row["gcal_token"]:
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE gcal_integrations SET gcal_token=? WHERE id=?",
+                        (new_token, row["id"]),
+                    )
+                    conn.commit()
+                log.info(f"Refreshed gcal_integrations token for integration {row['id']} (guild {row['guild_id']})")
+            elif new_token is None:
+                log.warning(f"Could not refresh token for integration {row['id']} (guild {row['guild_id']}) — posts may fail")
+
+    @token_refresh_loop.before_loop
+    async def before_token_refresh_loop(self):
+        await self.bot.wait_until_ready()
 
 
 def setup(bot: discord.Bot):

@@ -83,7 +83,7 @@ class Ping(commands.Cog):
         )
         embed.add_field(
             name="Support",
-            value=f"🔗 [{SUPPORT_URL}]({SUPPORT_URL})",
+            value=f"🔗 {SUPPORT_URL}",
             inline=True,
         )
         embed.set_footer(

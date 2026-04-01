@@ -91,7 +91,7 @@ async def on_guild_join(guild: discord.Guild):
         await channel.send(embed=embed)
 
 
-async def load_cogs():
+def load_cogs():
     """Load every cog listed in COGS."""
     for cog in COGS:
         try:
@@ -103,7 +103,7 @@ async def load_cogs():
 
 if __name__ == "__main__":
     init_db()
-    asyncio.run(load_cogs())
+    load_cogs()
     try:
         bot.run(TOKEN)
     except KeyboardInterrupt:

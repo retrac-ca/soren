@@ -5,17 +5,14 @@ Handles all button interactions on event embeds.
 
 Button layout on each event post
 ----------------------------------
-  [ <accept_label> ]  [ <tentative_label> ]  [ <decline_label> ]  [ ✏️ Edit ]
+  [ <accept_label> ]  [ <tentative_label> (optional) ]  [ <decline_label> ]
 
-  Tentative button is optional — hidden if btn_tentative_enabled=0.
-  Button labels are fully customizable per event.
+  Up to 2 additional custom buttons can be added via /eventbuttons.
+  Edit buttons have been removed — use /editeventdetails and /editeventtime.
 
 RSVP buttons — available to everyone:
   Clicking a button upserts the user's RSVP row and refreshes the embed.
-
-Edit button — visible to everyone, but restricted by role check:
-  Only members with the Event Creator role (or server admins) can use it.
-  Clicking it opens the EditEventModal pre-filled with the current event data.
+  A per-user cooldown prevents button spam.
 
 Free tier caps the displayed RSVP list at 50 names per status column.
 """
@@ -24,12 +21,11 @@ import discord
 from discord.ext import commands
 
 from utils.database import get_connection, is_premium
-from utils.permissions import is_event_creator
 from utils.embeds import build_event_embed
+from datetime import datetime, timezone
 import logging
 
 log = logging.getLogger("soren.rsvp")
-
 
 # ── Free tier display cap ─────────────────────────────────────────────────────
 FREE_RSVP_DISPLAY_LIMIT = 50
@@ -38,6 +34,10 @@ FREE_RSVP_DISPLAY_LIMIT = 50
 DEFAULT_ACCEPT_LABEL    = "✅ Accept"
 DEFAULT_TENTATIVE_LABEL = "❓ Tentative"
 DEFAULT_DECLINE_LABEL   = "❌ Decline"
+
+# ── RSVP cooldown (per user per event, in seconds) ────────────────────────────
+RSVP_COOLDOWN_SECONDS = 3
+_rsvp_cooldowns: dict[tuple, datetime] = {}
 
 
 # ── Database helpers ──────────────────────────────────────────────────────────
@@ -80,26 +80,59 @@ def fetch_rsvps_for_embed(event_id: int, guild: discord.Guild, premium: bool) ->
         for status in result:
             overflow = counts[status] - len(result[status])
             if overflow > 0:
-                result[status].append(
-                    f"*(+{overflow} more — upgrade to Premium to see all)*"
-                )
+                result[status].append(f"*(+{overflow} more — upgrade to Premium to see all)*")
 
     return result
+
+
+async def _promote_from_waitlist(event_id: int, guild: discord.Guild, bot: discord.Bot):
+    """
+    When an accepted RSVP is removed, check the waitlist and notify
+    the next person in line that a spot has opened up.
+    """
+    with get_connection() as conn:
+        # Check if table exists first (graceful degradation)
+        try:
+            next_entry = conn.execute(
+                "SELECT * FROM waitlist WHERE event_id=? ORDER BY id ASC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+        except Exception:
+            return
+
+    if not next_entry:
+        return
+
+    member = guild.get_member(next_entry["user_id"])
+    if not member:
+        return
+
+    with get_connection() as conn:
+        event_row = conn.execute("SELECT title FROM events WHERE id=?", (event_id,)).fetchone()
+    if not event_row:
+        return
+
+    try:
+        await member.send(
+            f"🎉 A spot has opened up for **{event_row['title']}**! "
+            f"Head back to the event and click ✅ Accept to claim your spot."
+        )
+        log.info(f"Waitlist: notified {member} for event {event_id}")
+    except discord.Forbidden:
+        log.warning(f"Waitlist: could not DM {member} (DMs disabled)")
 
 
 async def refresh_event_embed(event_id: int, guild: discord.Guild, bot: discord.Bot):
     """
     Re-fetch RSVP data and edit the original Discord message so the embed
     always shows the current attendee list.
-    Called after any RSVP change or event edit.
     """
     event = fetch_event(event_id)
     if not event:
         return
 
-    # Attach guild embed color
     from utils.database import get_guild_config
-    cfg = get_guild_config(guild.id)
+    cfg   = get_guild_config(guild.id)
     event = {**event, "embed_color": cfg.get("embed_color") if cfg else None}
 
     premium = is_premium(guild.id)
@@ -108,25 +141,27 @@ async def refresh_event_embed(event_id: int, guild: discord.Guild, bot: discord.
 
     try:
         channel = guild.get_channel(event["channel_id"])
-        if channel and event.get("message_id"):
+        if not channel:
+            log.warning(f"refresh_event_embed: channel {event['channel_id']} not found for event {event_id}")
+            return
+        if event.get("message_id"):
             msg  = await channel.fetch_message(event["message_id"])
             view = EventView(event_id=event_id, event=event)
             await msg.edit(embed=embed, view=view)
     except discord.NotFound:
         log.warning(f"refresh_event_embed: message not found for event {event_id}")
     except discord.Forbidden:
-        log.warning(f"refresh_event_embed: no permission to edit message for event {event_id}")
+        log.warning(f"refresh_event_embed: no permission to edit message for event {event_id} in channel {event['channel_id']}")
     except Exception as e:
         log.error(f"refresh_event_embed: unexpected error for event {event_id}: {e}")
 
 
 # ── Dynamic event view ────────────────────────────────────────────────────────
+
 class EventView(discord.ui.View):
     """
-    Persistent view with up to four buttons:
-      <accept>  |  <tentative> (optional)  |  <decline>  |  ✏️ Edit
-
-    Button labels and tentative visibility are read from the event record.
+    Persistent view with up to 5 RSVP buttons.
+    Edit buttons have been removed — editing is done via slash commands.
     timeout=None keeps buttons active indefinitely across bot restarts.
     """
 
@@ -134,7 +169,6 @@ class EventView(discord.ui.View):
         super().__init__(timeout=None)
         self.event_id = event_id
 
-        # Read config from event dict (fall back to defaults if not provided)
         accept_label    = DEFAULT_ACCEPT_LABEL
         tentative_label = DEFAULT_TENTATIVE_LABEL
         decline_label   = DEFAULT_DECLINE_LABEL
@@ -174,25 +208,53 @@ class EventView(discord.ui.View):
         decline_btn.callback = self._make_rsvp_callback("declined")
         self.add_item(decline_btn)
 
-        # ── Edit button (always shown, role-restricted) ───────────────────
-        edit_btn = discord.ui.Button(
-            label="✏️ Edit",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"event_edit:{event_id}",
-        )
-        edit_btn.callback = self._edit_callback
-        self.add_item(edit_btn)
-
     def _make_rsvp_callback(self, status: str):
         """Returns an async callback bound to the given RSVP status."""
         async def callback(interaction: discord.Interaction):
-            event = fetch_event(self.event_id)
-            if not event:
+            # ── Cooldown check ────────────────────────────────────────────
+            cooldown_key = (interaction.user.id, self.event_id)
+            now = datetime.now(timezone.utc)
+            last = _rsvp_cooldowns.get(cooldown_key)
+            if last and (now - last).total_seconds() < RSVP_COOLDOWN_SECONDS:
                 await interaction.response.send_message(
-                    "This event no longer exists.", ephemeral=True
+                    "You're clicking too fast — please wait a moment before changing your RSVP.",
+                    ephemeral=True,
                 )
                 return
+            _rsvp_cooldowns[cooldown_key] = now
 
+            event = fetch_event(self.event_id)
+            if not event:
+                await interaction.response.send_message("This event no longer exists.", ephemeral=True)
+                return
+
+            # ── Max RSVP / waitlist check ─────────────────────────────────
+            if status == "accepted" and event.get("max_rsvp", 0) > 0:
+                with get_connection() as conn:
+                    count = conn.execute(
+                        "SELECT COUNT(*) as cnt FROM rsvps WHERE event_id=? AND status='accepted'",
+                        (self.event_id,),
+                    ).fetchone()["cnt"]
+                if count >= event["max_rsvp"]:
+                    from cogs.events import WaitlistView
+                    await interaction.response.send_message(
+                        "This event is full! Would you like to join the waitlist?",
+                        view=WaitlistView(event_id=self.event_id),
+                        ephemeral=True,
+                    )
+                    return
+
+            # ── Check if switching away from accepted (for waitlist promotion) ──
+            was_accepted = False
+            with get_connection() as conn:
+                prev = conn.execute(
+                    "SELECT status FROM rsvps WHERE event_id=? AND user_id=?",
+                    (self.event_id, interaction.user.id),
+                ).fetchone()
+                if prev and prev["status"] == "accepted" and status != "accepted":
+                    was_accepted = True
+
+            # ── Upsert RSVP ───────────────────────────────────────────────
             with get_connection() as conn:
                 conn.execute(
                     """
@@ -205,12 +267,8 @@ class EventView(discord.ui.View):
                 )
                 conn.commit()
 
-            log.info(
-                f"RSVP: {interaction.user} set status='{status}' "
-                f"on event {self.event_id} in guild {interaction.guild_id}"
-            )
+            log.info(f"RSVP: {interaction.user} set status='{status}' on event {self.event_id} in guild {interaction.guild_id}")
 
-            # Use the custom label for the confirmation message
             label_map = {
                 "accepted":  event.get("btn_accept_label")    or DEFAULT_ACCEPT_LABEL,
                 "declined":  event.get("btn_decline_label")   or DEFAULT_DECLINE_LABEL,
@@ -223,29 +281,15 @@ class EventView(discord.ui.View):
 
             await refresh_event_embed(self.event_id, interaction.guild, interaction.client)
 
+            # ── Waitlist promotion ────────────────────────────────────────
+            if was_accepted:
+                await _promote_from_waitlist(self.event_id, interaction.guild, interaction.client)
+
         return callback
-
-    async def _edit_callback(self, interaction: discord.Interaction):
-        """Opens the EditEventModal. Restricted to Event Creator role / admins."""
-        if not is_event_creator(interaction.user):
-            await interaction.response.send_message(
-                "❌ You need the **Event Creator** role to edit events.",
-                ephemeral=True,
-            )
-            return
-
-        event = fetch_event(self.event_id)
-        if not event:
-            await interaction.response.send_message(
-                "This event no longer exists.", ephemeral=True
-            )
-            return
-
-        from cogs.events import EditEventModal
-        await interaction.response.send_modal(EditEventModal(event=event))
 
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
+
 class RSVP(commands.Cog):
     """Registers the persistent EventView on bot startup."""
 
@@ -254,13 +298,18 @@ class RSVP(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        """
-        Re-register the persistent view every time the bot starts.
-        Without this, buttons stop responding after a restart.
-        We register with event_id=0 and no event dict — the custom_id
-        prefix is what Discord uses to route interactions.
-        """
+        """Re-register persistent views on every bot start."""
         self.bot.add_view(EventView(event_id=0))
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE message_id IS NOT NULL AND start_time > ?",
+                (now_iso,),
+            ).fetchall()
+        for row in rows:
+            event = dict(row)
+            self.bot.add_view(EventView(event_id=event["id"], event=event))
 
 
 def setup(bot: discord.Bot):

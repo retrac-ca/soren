@@ -11,7 +11,6 @@ import logging
 
 log = logging.getLogger("soren.db")
 
-# Path to the SQLite file — stored in the data/ folder
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "soren.db")
 
 
@@ -33,40 +32,41 @@ def init_db():
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-    conn = get_connection()
+    conn   = get_connection()
     cursor = conn.cursor()
 
-    # ── Guild configuration ──────────────────────────────────────────────
+    # ── Guild configuration ───────────────────────────────────────────────
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS guild_config (
             guild_id        INTEGER PRIMARY KEY,
             creator_role_id INTEGER,
             is_premium      INTEGER DEFAULT 0,
             gcal_token      TEXT,
-            gcal_id         TEXT
+            gcal_id         TEXT,
+            embed_color     TEXT    DEFAULT '5865F2'
         )
     """)
 
-    # ── Discord-created events (slash command events with RSVP) ──────────
+    # ── Events ───────────────────────────────────────────────────────────
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS events (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id        INTEGER NOT NULL,
-            channel_id      INTEGER NOT NULL,
-            message_id      INTEGER,
-            creator_id      INTEGER NOT NULL,
-            title           TEXT    NOT NULL,
-            description     TEXT,
-            timezone        TEXT    DEFAULT 'UTC',
-            start_time      TEXT    NOT NULL,
-            end_time        TEXT,
-            is_recurring    INTEGER DEFAULT 0,
-            recur_rule      TEXT,
-            recur_interval  INTEGER DEFAULT 1,
-            recur_end       TEXT,
-            parent_event_id INTEGER,
-            reminder_offset INTEGER DEFAULT 15,
-            notify_role_id  INTEGER,
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id              INTEGER NOT NULL,
+            channel_id            INTEGER NOT NULL,
+            message_id            INTEGER,
+            creator_id            INTEGER NOT NULL,
+            title                 TEXT    NOT NULL,
+            description           TEXT,
+            timezone              TEXT    DEFAULT 'UTC',
+            start_time            TEXT    NOT NULL,
+            end_time              TEXT,
+            is_recurring          INTEGER DEFAULT 0,
+            recur_rule            TEXT,
+            recur_interval        INTEGER DEFAULT 1,
+            recur_end             TEXT,
+            parent_event_id       INTEGER,
+            reminder_offset       INTEGER DEFAULT 15,
+            notify_role_id        INTEGER,
             gcal_event_id         TEXT,
             reminded_at           TEXT,
             embed_color           TEXT    DEFAULT '5865F2',
@@ -74,12 +74,13 @@ def init_db():
             btn_tentative_label   TEXT    DEFAULT '❓ Tentative',
             btn_decline_label     TEXT    DEFAULT '❌ Decline',
             btn_tentative_enabled INTEGER DEFAULT 1,
+            max_rsvp              INTEGER DEFAULT 0,
             created_at            TEXT    DEFAULT (datetime('now')),
             FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id)
         )
     """)
 
-    # ── Migration: add button columns to existing databases ──────────────
+    # ── Migrations: events table ──────────────────────────────────────────
     for col, definition in [
         ("btn_accept_label",      "TEXT DEFAULT '✅ Accept'"),
         ("btn_tentative_label",   "TEXT DEFAULT '❓ Tentative'"),
@@ -87,13 +88,20 @@ def init_db():
         ("btn_tentative_enabled", "INTEGER DEFAULT 1"),
         ("reminded_at",           "TEXT"),
         ("embed_color",           "TEXT DEFAULT '5865F2'"),
+        ("max_rsvp",              "INTEGER DEFAULT 0"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
         except Exception:
-            pass  # Column already exists
+            pass
 
-    # ── RSVPs ────────────────────────────────────────────────────────────
+    # ── Migration: guild_config ───────────────────────────────────────────
+    try:
+        cursor.execute("ALTER TABLE guild_config ADD COLUMN embed_color TEXT DEFAULT '5865F2'")
+    except Exception:
+        pass
+
+    # ── RSVPs ─────────────────────────────────────────────────────────────
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS rsvps (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,34 +114,48 @@ def init_db():
         )
     """)
 
-    # ── G-Cal Integrations ───────────────────────────────────────────────
-    # Stores one row per connected Google Calendar per guild.
-    # Each calendar is completely independent: its own OAuth token,
-    # its own target Discord channel, and its own posting schedule.
-    # This table is ONLY used by the gcal_integrations cog and has
-    # no connection to the slash-command events table above.
+    # ── Waitlist ──────────────────────────────────────────────────────────
+    # Stores users waiting for a spot when an event hits max_rsvp.
+    # Ordered by id (insertion order) — first in, first notified.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS waitlist (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id    INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            joined_at   TEXT    DEFAULT (datetime('now')),
+            UNIQUE(event_id, user_id),
+            FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+        )
+    """)
+
+    # ── G-Cal Integrations ────────────────────────────────────────────────
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS gcal_integrations (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id        INTEGER NOT NULL,
-            label           TEXT    NOT NULL,   -- Friendly name, e.g. "MMA Events"
-            calendar_id     TEXT    NOT NULL,   -- Google Calendar ID (e.g. abc@group.calendar.google.com)
-            gcal_token      TEXT    NOT NULL,   -- OAuth2 token JSON for this calendar
-            channel_id      INTEGER NOT NULL,   -- Discord channel to post summaries into
-            schedule        TEXT    DEFAULT 'weekly', -- 'daily', 'weekly', or 'custom'
-            custom_interval INTEGER DEFAULT 7,  -- Days between posts (used when schedule='custom')
-            post_day        TEXT    DEFAULT 'monday', -- Day of week to post (weekly schedule)
-            post_hour       INTEGER DEFAULT 9,  -- Hour of day to post (0-23, server local time)
-            last_posted     TEXT,               -- ISO datetime of last successful post
-            active          INTEGER DEFAULT 1,  -- 1 = enabled, 0 = paused
+            label           TEXT    NOT NULL,
+            calendar_id     TEXT    NOT NULL,
+            calendar_name   TEXT,
+            gcal_token      TEXT    NOT NULL,
+            channel_id      INTEGER NOT NULL,
+            schedule        TEXT    DEFAULT 'weekly',
+            custom_interval INTEGER DEFAULT 7,
+            post_day        TEXT    DEFAULT 'monday',
+            post_hour       INTEGER DEFAULT 9,
+            last_posted     TEXT,
+            active          INTEGER DEFAULT 1,
             created_at      TEXT    DEFAULT (datetime('now')),
             FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id)
         )
     """)
 
-    # ── Redeemed premium codes ───────────────────────────────────────────
-    # Tracks which codes have already been redeemed so they can't be reused.
-    # The valid code list lives in premium_keys.txt, not here.
+    # ── Migration: gcal_integrations — add calendar_name column ──────────
+    try:
+        cursor.execute("ALTER TABLE gcal_integrations ADD COLUMN calendar_name TEXT")
+    except Exception:
+        pass
+
+    # ── Redeemed premium codes ────────────────────────────────────────────
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS redeemed_codes (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,7 +170,7 @@ def init_db():
     log.info("Database initialised successfully.")
 
 
-# ── Convenience helpers ──────────────────────────────────────────────────────
+# ── Convenience helpers ───────────────────────────────────────────────────────
 
 def get_guild_config(guild_id: int) -> dict | None:
     """Fetch config row for a guild, or None if not set up yet."""
@@ -162,7 +184,6 @@ def get_guild_config(guild_id: int) -> dict | None:
 def upsert_guild_config(guild_id: int, **kwargs):
     """
     Insert or update guild config fields.
-    Pass the fields you want to set as keyword arguments.
     Example: upsert_guild_config(123, creator_role_id=456)
     """
     config = get_guild_config(guild_id) or {}

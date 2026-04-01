@@ -216,7 +216,7 @@ Reminders fire at your chosen time before each event. The offset is set during `
 
 ## 💎 Premium
 
-Free servers: **5 events max**, **50 RSVP names shown**, **3 embed colors**.
+Free servers: **10 events max**, **50 RSVP names shown**, **3 embed colors**.
 
 To activate premium, a server admin runs `/premiumcode <code>` with a valid code.
 
