@@ -463,7 +463,7 @@ class EditEventDetailsModal(discord.ui.Modal):
     """
 
     def __init__(self, event: dict, guild: discord.Guild, *args, **kwargs):
-        super().__init__(title=f"Edit Details: {event['title'][:31]}", *args, **kwargs)
+        super().__init__(title="Edit Event Details", *args, **kwargs)
         self.event = event
 
         # Resolve current notify role name for pre-fill
@@ -549,7 +549,7 @@ class EditEventTimeModal(discord.ui.Modal):
     """
 
     def __init__(self, event: dict, *args, **kwargs):
-        super().__init__(title=f"Edit Time: {event['title'][:34]}", *args, **kwargs)
+        super().__init__(title="Edit Event Time", *args, **kwargs)
         self.event = event
 
         self.add_item(discord.ui.InputText(
@@ -653,7 +653,7 @@ class EventButtonsModal(discord.ui.Modal):
     """
 
     def __init__(self, event: dict, premium: bool, *args, **kwargs):
-        super().__init__(title=f"Button Settings: {event['title'][:28]}", *args, **kwargs)
+        super().__init__(title="Button Settings", *args, **kwargs)
         self.event   = event
         self.premium = premium
 
