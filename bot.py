@@ -8,6 +8,7 @@ import discord
 from discord.ext import commands
 import os
 import logging
+import logging.handlers
 import asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -16,13 +17,78 @@ from utils.database import init_db
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# ── Logging setup ─────────────────────────────────────────────────────────────
+# Logs go to both the console (stdout) and a monthly rotating file.
+# A new log file is created each month: logs/soren_YYYY_MM.log
+# Files are kept for 24 months before being automatically removed.
+
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_DIR     = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+class MonthlyRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """
+    Rotates log files at the start of each calendar month.
+    TimedRotatingFileHandler with 'midnight' + interval=1 rolls daily by default;
+    we override namer and the rotation check to give us monthly files named
+    soren_YYYY_MM.log instead.
+    """
+
+    def __init__(self, log_dir: str, backup_count: int = 24):
+        # Use the current month's filename as the base file
+        filename = self._month_filename(log_dir)
+        super().__init__(
+            filename=filename,
+            when="midnight",
+            interval=1,
+            backupCount=backup_count,
+            encoding="utf-8",
+            delay=False,
+        )
+        self.log_dir = log_dir
+
+    @staticmethod
+    def _month_filename(log_dir: str) -> str:
+        now = datetime.now()
+        return os.path.join(log_dir, f"soren_{now.strftime('%Y_%m')}.log")
+
+    def shouldRollover(self, record) -> int:
+        """Roll over when the calendar month changes."""
+        expected = self._month_filename(self.log_dir)
+        return 1 if self.baseFilename != expected else 0
+
+    def doRollover(self):
+        """Switch to the new month's file."""
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        self.baseFilename = self._month_filename(self.log_dir)
+        self.stream = self._open()
+
+
+def _setup_logging():
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(LOG_FORMAT)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # Monthly file handler
+    file_handler = MonthlyRotatingFileHandler(LOG_DIR, backup_count=24)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+
+_setup_logging()
 log = logging.getLogger("soren")
 
-intents = discord.Intents.default()
+# ── Bot setup ─────────────────────────────────────────────────────────────────
+intents         = discord.Intents.default()
 intents.members = True
 
 bot = discord.Bot(intents=intents)
@@ -44,11 +110,12 @@ async def on_ready():
     """Fires when the bot has connected to Discord."""
     bot.start_time = datetime.now(timezone.utc)
     log.info(f"Soren is online as {bot.user} (ID: {bot.user.id})")
+    log.info(f"Serving {len(bot.guilds)} guild(s)")
 
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="your calendar 📅"
+            name="your calendar 📅",
         )
     )
 
@@ -68,7 +135,7 @@ async def _sync_commands():
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     """Fires when Soren joins a new server."""
-    log.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
+    log.info(f"Joined new guild: {guild.name} (ID: {guild.id}) — now in {len(bot.guilds)} guild(s)")
 
     channel = guild.system_channel
     if channel is None:
@@ -79,16 +146,26 @@ async def on_guild_join(guild: discord.Guild):
 
     if channel:
         embed = discord.Embed(
-            title="👋 Thanks for adding Soren!",
+            title="👋  Thanks for adding Soren!",
             description=(
-                "I'm your new calendar & events bot.\n\n"
+                "I'm your new calendar and events bot.\n\n"
                 "**Before I can be used, a server admin needs to run:**\n"
                 "`/setup` — to assign the Event Creator role and configure settings.\n\n"
-                "Once setup is complete, use `/help` to see all available commands."
+                "Once setup is complete, use `/help` to see all available commands.\n\n"
+                "Need help? Visit **https://soren.retrac.ca**"
             ),
             color=discord.Color.blurple(),
         )
-        await channel.send(embed=embed)
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            log.warning(f"Could not send welcome message in guild {guild.id} — missing permissions in channel {channel.id}")
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    """Fires when Soren is removed from a server."""
+    log.info(f"Removed from guild: {guild.name} (ID: {guild.id}) — now in {len(bot.guilds)} guild(s)")
 
 
 def load_cogs():

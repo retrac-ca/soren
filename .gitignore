@@ -6,6 +6,10 @@ google_credentials.json
 data/soren.db
 data/
 
+# Logs
+logs/
+*.log
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -27,10 +31,6 @@ env/
 
 # macOS
 .DS_Store
-
-# Logs
-*.log
-logs/
 
 # Soren Premium Keys
 premium_keys.txt

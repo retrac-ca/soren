@@ -624,24 +624,69 @@ class EditEventTimeModal(discord.ui.Modal):
 # ── Event Buttons Modal ───────────────────────────────────────────────────────
 
 class EventButtonsModal(discord.ui.Modal):
-    def __init__(self, event: dict, *args, **kwargs):
+    """
+    Free servers: toggle Tentative button on/off only.
+    Premium servers: toggle Tentative + set custom labels for all three buttons.
+
+    Free modal  (2 of 5 slots): Show Tentative · Accept Label (read-only hint)
+    Premium modal (4 of 5 slots): Show Tentative · Accept Label · Tentative Label · Decline Label
+    """
+
+    def __init__(self, event: dict, premium: bool, *args, **kwargs):
         super().__init__(title=f"Button Settings: {event['title'][:35]}", *args, **kwargs)
-        self.event = event
+        self.event   = event
+        self.premium = premium
 
         current = "yes" if event.get("btn_tentative_enabled", 1) else "no"
-        self.add_item(discord.ui.InputText(label="Show Tentative Button? (yes / no)", value=current, max_length=3))
-        self.add_item(discord.ui.InputText(label="Accept Button Label", value=event.get("btn_accept_label", "✅ Accept"), max_length=20))
-        self.add_item(discord.ui.InputText(label="Tentative Button Label", value=event.get("btn_tentative_label", "❓ Tentative"), max_length=20))
-        self.add_item(discord.ui.InputText(label="Decline Button Label", value=event.get("btn_decline_label", "❌ Decline"), max_length=20))
+
+        # Field 1 — always shown (free + premium)
+        self.add_item(discord.ui.InputText(
+            label="Show Tentative Button? (yes / no)",
+            value=current,
+            max_length=3,
+        ))
+
+        if premium:
+            # Fields 2–4 — custom labels (premium only)
+            self.add_item(discord.ui.InputText(
+                label="Accept Button Label",
+                value=event.get("btn_accept_label") or "✅ Accept",
+                max_length=20,
+            ))
+            self.add_item(discord.ui.InputText(
+                label="Tentative Button Label",
+                value=event.get("btn_tentative_label") or "❓ Tentative",
+                max_length=20,
+            ))
+            self.add_item(discord.ui.InputText(
+                label="Decline Button Label",
+                value=event.get("btn_decline_label") or "❌ Decline",
+                max_length=20,
+            ))
+        else:
+            # Show a read-only hint so free users know labels exist as a premium feature
+            self.add_item(discord.ui.InputText(
+                label="Custom Labels (⭐ Premium only)",
+                value="Upgrade to Premium to set custom button labels.",
+                required=False,
+                max_length=50,
+            ))
 
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
 
-        show_raw        = self.children[0].value.strip().lower()
-        show_tentative  = 0 if show_raw in ("no", "n", "false", "0") else 1
-        accept_label    = self.children[1].value.strip() or "✅ Accept"
-        tentative_label = self.children[2].value.strip() or "❓ Tentative"
-        decline_label   = self.children[3].value.strip() or "❌ Decline"
+        show_raw       = self.children[0].value.strip().lower()
+        show_tentative = 0 if show_raw in ("no", "n", "false", "0") else 1
+
+        if self.premium:
+            accept_label    = self.children[1].value.strip() or "✅ Accept"
+            tentative_label = self.children[2].value.strip() or "❓ Tentative"
+            decline_label   = self.children[3].value.strip() or "❌ Decline"
+        else:
+            # Keep existing labels unchanged for free servers
+            accept_label    = self.event.get("btn_accept_label")    or "✅ Accept"
+            tentative_label = self.event.get("btn_tentative_label") or "❓ Tentative"
+            decline_label   = self.event.get("btn_decline_label")   or "❌ Decline"
 
         with get_connection() as conn:
             conn.execute(
@@ -651,8 +696,11 @@ class EventButtonsModal(discord.ui.Modal):
             conn.commit()
 
         state = "visible" if show_tentative else "hidden"
+        label_note = " Labels updated." if self.premium else ""
         await interaction.response.send_message(
-            embed=build_success_embed(f"Updated **{self.event['title']}** — Tentative button is now **{state}**. Labels saved."),
+            embed=build_success_embed(
+                f"Updated **{self.event['title']}** — Tentative button is now **{state}**.{label_note}"
+            ),
             ephemeral=True,
         )
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
@@ -906,7 +954,7 @@ class Events(commands.Cog):
             await ctx.respond(embed=view._build_embed(), view=view, ephemeral=True)
 
     # ── /eventbuttons ─────────────────────────────────────────────────────
-    @discord.slash_command(name="eventbuttons", description="Customize the RSVP button labels for an event.")
+    @discord.slash_command(name="eventbuttons", description="Customize RSVP button labels and toggle the Tentative button.")
     async def eventbuttons(
         self,
         ctx: discord.ApplicationContext,
@@ -920,7 +968,9 @@ class Events(commands.Cog):
         if not row:
             await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
             return
-        await ctx.send_modal(EventButtonsModal(event=dict(row)))
+
+        premium = is_premium(ctx.guild.id)
+        await ctx.send_modal(EventButtonsModal(event=dict(row), premium=premium))
 
     # ── /cancelevent ──────────────────────────────────────────────────────
     @discord.slash_command(name="cancelevent", description="Soft cancel an event (marks as cancelled without deleting).")
@@ -939,7 +989,7 @@ class Events(commands.Cog):
             return
 
         event = dict(row)
-        cancelled_title = f"~~{event['title']}~~ — CANCELLED"
+        cancelled_title = f"[CANCELLED] {event['title']}"
         cancelled_desc  = (event.get("description") or "") + "\n\n*This event has been cancelled.*"
         with get_connection() as conn:
             conn.execute("UPDATE events SET title=?, description=? WHERE id=?", (cancelled_title, cancelled_desc, event_id))
