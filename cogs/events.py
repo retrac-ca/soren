@@ -130,12 +130,13 @@ RECUR_LABELS = {
 # ── Autocomplete helpers ──────────────────────────────────────────────────────
 
 async def autocomplete_event_ids(ctx: discord.AutocompleteContext):
-    """Autocomplete for event IDs, showing ID: Title."""
-    now_iso = datetime.now(timezone.utc).isoformat()
+    """Autocomplete for event IDs, showing ID: Title. Includes events from today onwards."""
+    now = datetime.now(timezone.utc)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT id, title FROM events WHERE guild_id=? AND start_time > ? ORDER BY start_time ASC LIMIT 25",
-            (ctx.interaction.guild.id, now_iso)
+            "SELECT id, title FROM events WHERE guild_id=? AND start_time >= ? ORDER BY start_time ASC LIMIT 25",
+            (ctx.interaction.guild.id, start_of_day)
         ).fetchall()
     return [discord.OptionChoice(name=f"{row['id']}: {row['title'][:80]}", value=row['id']) for row in rows]
 
@@ -461,9 +462,16 @@ class EditEventDetailsModal(discord.ui.Modal):
     Fields: Title · Description · Max RSVPs · Notify Role  (4 of 5 slots used)
     """
 
-    def __init__(self, event: dict, *args, **kwargs):
+    def __init__(self, event: dict, guild: discord.Guild, *args, **kwargs):
         super().__init__(title=f"Edit Details: {event['title'][:35]}", *args, **kwargs)
         self.event = event
+
+        # Resolve current notify role name for pre-fill
+        notify_role_value = ""
+        if event.get("notify_role_id"):
+            role = guild.get_role(event["notify_role_id"])
+            if role:
+                notify_role_value = role.name
 
         self.add_item(discord.ui.InputText(
             label="Event Title",
@@ -484,8 +492,8 @@ class EditEventDetailsModal(discord.ui.Modal):
         ))
         self.add_item(discord.ui.InputText(
             label="Notify Role (optional)",
-            value="",
-            placeholder="Role name, @Role, or role ID — leave blank to keep current",
+            value=notify_role_value,
+            placeholder="Role name, @Role, or role ID — leave blank to clear",
             required=False,
             max_length=100,
         ))
@@ -493,10 +501,12 @@ class EditEventDetailsModal(discord.ui.Modal):
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
 
-        title       = self.children[0].value.strip()
-        description = self.children[1].value.strip()
+        await interaction.response.defer(ephemeral=True)
+
+        title        = self.children[0].value.strip()
+        description  = self.children[1].value.strip()
         max_rsvp_raw = self.children[2].value.strip()
-        role_raw    = self.children[3].value.strip()
+        role_raw     = self.children[3].value.strip()
 
         try:
             max_rsvp = max(0, int(max_rsvp_raw))
@@ -522,7 +532,7 @@ class EditEventDetailsModal(discord.ui.Modal):
             )
             conn.commit()
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=build_success_embed(f"Details updated for **{title}**."),
             ephemeral=True,
         )
@@ -570,14 +580,22 @@ class EditEventTimeModal(discord.ui.Modal):
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
 
+        # Defer immediately — dateparser can exceed Discord's 3s timeout,
+        # and deferring also lets us send proper error embeds via followup
+        await interaction.response.defer(ephemeral=True)
+
         start_raw    = self.children[0].value.strip()
         end_raw      = self.children[1].value.strip()
         tz_name      = self.children[2].value.strip() or "UTC"
         reminder_raw = self.children[3].value.strip()
 
         if tz_name not in pytz.all_timezones:
-            await interaction.response.send_message(
-                embed=build_error_embed(f"Unknown timezone: `{tz_name}`. Use a valid tz name like `America/New_York`."),
+            await interaction.followup.send(
+                embed=build_error_embed(
+                    f"Unknown timezone: `{tz_name}`.\n"
+                    "Use a standard tz name like `America/New_York`, `Europe/London`, or `UTC`.\n"
+                    "Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
+                ),
                 ephemeral=True,
             )
             return
@@ -589,8 +607,10 @@ class EditEventTimeModal(discord.ui.Modal):
 
         start_dt = _parse_datetime(start_raw, tz_name)
         if not start_dt:
-            await interaction.response.send_message(
-                embed=build_error_embed("Couldn't parse the start date/time. Try `2026-07-04 20:00` or `July 4 8pm`."),
+            await interaction.followup.send(
+                embed=build_error_embed(
+                    "Couldn't parse the start date/time. Try `2026-07-04 20:00` or `July 4 8pm`."
+                ),
                 ephemeral=True,
             )
             return
@@ -600,7 +620,7 @@ class EditEventTimeModal(discord.ui.Modal):
         if end_raw:
             end_dt = _parse_datetime(end_raw, tz_name)
             if not end_dt:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     embed=build_error_embed("Couldn't parse the end date/time."),
                     ephemeral=True,
                 )
@@ -614,7 +634,7 @@ class EditEventTimeModal(discord.ui.Modal):
             )
             conn.commit()
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=build_success_embed(f"Time updated for **{self.event['title']}**."),
             ephemeral=True,
         )
@@ -892,7 +912,7 @@ class Events(commands.Cog):
         if not row:
             await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
             return
-        await ctx.send_modal(EditEventDetailsModal(event=dict(row)))
+        await ctx.send_modal(EditEventDetailsModal(event=dict(row), guild=ctx.guild))
 
     # ── /editeventtime ────────────────────────────────────────────────────
     @discord.slash_command(name="editeventtime", description="Edit an event's start/end time, timezone, or reminder.")
@@ -938,11 +958,15 @@ class Events(commands.Cog):
     # ── /listevents ───────────────────────────────────────────────────────
     @discord.slash_command(name="listevents", description="List all upcoming events in this server.")
     async def listevents(self, ctx: discord.ApplicationContext):
-        now_iso = datetime.now(timezone.utc).isoformat()
+        # Use start of today (UTC midnight) so events happening later today are included
+        now = datetime.now(timezone.utc)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_iso = start_of_day.isoformat()
+
         with get_connection() as conn:
             rows = conn.execute(
                 "SELECT id, title, start_time, timezone, channel_id, is_recurring, recur_rule FROM events WHERE guild_id=? AND start_time >= ? ORDER BY start_time ASC",
-                (ctx.guild.id, now_iso),
+                (ctx.guild.id, start_iso),
             ).fetchall()
         if not rows:
             await ctx.respond(embed=build_error_embed("No upcoming events. Create one with `/newevent`!"), ephemeral=True)
@@ -989,6 +1013,15 @@ class Events(commands.Cog):
             return
 
         event = dict(row)
+
+        # Guard against cancelling an already-cancelled event
+        if event["title"].startswith("[CANCELLED]"):
+            await ctx.respond(
+                embed=build_error_embed("This event has already been cancelled."),
+                ephemeral=True,
+            )
+            return
+
         cancelled_title = f"[CANCELLED] {event['title']}"
         cancelled_desc  = (event.get("description") or "") + "\n\n*This event has been cancelled.*"
         with get_connection() as conn:
