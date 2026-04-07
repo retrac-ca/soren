@@ -90,7 +90,7 @@ class Premium(commands.Cog):
                 "**Unlocked:**\n"
                 f"• Up to **{PREMIUM_EVENT_LIMIT}** active events\n"
                 "• Up to **100** RSVP names displayed\n"
-                "• All 8 embed colors\n"
+                "• All 10 embed colors\n"
                 "• Up to **20** G-Cal integrations\n"
                 "• Mention/remind up to **3 roles** per event\n"
                 "• Custom RSVP button labels\n\n"
@@ -150,7 +150,7 @@ class Premium(commands.Cog):
             value=(
                 f"{PREMIUM_EVENT_LIMIT}\n"
                 "100\n"
-                "8 colors\n"
+                "10 colors\n"
                 "\u2705\n"
                 "\u2705\n"
                 "Up to 20\n"

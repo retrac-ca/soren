@@ -7,7 +7,7 @@ Commands
 --------
 /setup        — Assign Event Creator role (admin only); warns if already configured
 /config       — View current server settings
-/embedcolor   — Choose the event embed color (free: 3 options, premium: 8)
+/embedcolor   — Choose the event embed color (free: 3 options, premium: 10)
 """
 
 import discord
@@ -18,7 +18,8 @@ from utils.embeds import (
     FREE_COLORS, PREMIUM_COLORS, get_guild_color
 )
 from utils.database import is_premium
-from cogs.events import FREE_EVENT_LIMIT
+from cogs.events import FREE_EVENT_LIMIT, PREMIUM_EVENT_LIMIT
+from cogs.rsvp import FREE_RSVP_DISPLAY_LIMIT, PREMIUM_RSVP_DISPLAY_LIMIT
 import logging
 
 log = logging.getLogger("soren.setup")
@@ -36,6 +37,8 @@ PREMIUM_COLOR_OPTIONS = FREE_COLOR_OPTIONS + [
     discord.SelectOption(label="Cyan",   value="1ABC9C", emoji="🩵"),
     discord.SelectOption(label="Orange", value="E67E22", emoji="🟠"),
     discord.SelectOption(label="Brown",  value="98653C", emoji="🟤"),
+    discord.SelectOption(label="Pink",   value="E91E8C", emoji="🩷"),
+    discord.SelectOption(label="Olive",  value="808000", emoji="🫒"),
 ]
 
 
@@ -136,7 +139,6 @@ class Setup(commands.Cog):
     ):
         existing = get_guild_config(ctx.guild.id)
 
-        # Already configured — warn and confirm before overwriting
         if existing and existing.get("creator_role_id"):
             current_role = ctx.guild.get_role(existing["creator_role_id"])
             current_name = current_role.mention if current_role else f"ID {existing['creator_role_id']}"
@@ -157,7 +159,6 @@ class Setup(commands.Cog):
             )
             return
 
-        # First-time setup
         upsert_guild_config(ctx.guild.id, creator_role_id=event_role.id)
         log.info(f"Setup completed for guild {ctx.guild.id} ({ctx.guild.name})")
 
@@ -183,7 +184,11 @@ class Setup(commands.Cog):
     async def embedcolor(self, ctx: discord.ApplicationContext):
         premium     = is_premium(ctx.guild.id)
         color_count = len(PREMIUM_COLOR_OPTIONS) if premium else len(FREE_COLOR_OPTIONS)
-        tier_note   = "⭐ Premium — all 8 colors available" if premium else "Free — upgrade to Premium for 5 more colors"
+        tier_note   = (
+            f"⭐ Premium — all {len(PREMIUM_COLOR_OPTIONS)} colors available"
+            if premium else
+            f"Free — upgrade to Premium for {len(PREMIUM_COLOR_OPTIONS) - len(FREE_COLOR_OPTIONS)} more colors"
+        )
 
         embed = discord.Embed(
             title="🎨  Choose Embed Color",
@@ -208,10 +213,11 @@ class Setup(commands.Cog):
             )
             return
 
-        role     = ctx.guild.get_role(cfg.get("creator_role_id") or 0)
-        role_str = role.mention if role else "*(not set)*"
-        tier     = "⭐ Premium" if cfg.get("is_premium") else "Free"
-        hex_val  = cfg.get("embed_color") or "5865F2"
+        premium    = bool(cfg.get("is_premium"))
+        role       = ctx.guild.get_role(cfg.get("creator_role_id") or 0)
+        role_str   = role.mention if role else "*(not set)*"
+        tier       = "⭐ Premium" if premium else "Free"
+        hex_val    = cfg.get("embed_color") or "5865F2"
         color_name = next((o.label for o in PREMIUM_COLOR_OPTIONS if o.value == hex_val), f"#{hex_val}")
 
         embed = discord.Embed(title="⚙️  Soren Configuration", color=get_guild_color(hex_val))
@@ -219,13 +225,13 @@ class Setup(commands.Cog):
         embed.add_field(name="Plan",               value=tier,       inline=True)
         embed.add_field(name="Embed Color",        value=color_name, inline=True)
         embed.add_field(
-            name="Event Limit",
-            value="Unlimited" if cfg.get("is_premium") else str(FREE_EVENT_LIMIT),
+            name="Active Event Limit",
+            value=str(PREMIUM_EVENT_LIMIT) if premium else str(FREE_EVENT_LIMIT),
             inline=True,
         )
         embed.add_field(
-            name="RSVP Limit per Event",
-            value="Unlimited" if cfg.get("is_premium") else "50",
+            name="RSVP Names Shown",
+            value=str(PREMIUM_RSVP_DISPLAY_LIMIT) if premium else str(FREE_RSVP_DISPLAY_LIMIT),
             inline=True,
         )
         gcal = "✅ Connected" if cfg.get("gcal_id") else "❌ Not connected"

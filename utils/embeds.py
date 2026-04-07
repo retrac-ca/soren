@@ -18,14 +18,14 @@ COLOR_ERROR    = discord.Color.red()
 COLOR_WARNING  = discord.Color.orange()
 COLOR_REMINDER = discord.Color.gold()
 
-# Free tier color options
+# Free tier color options (3 colors)
 FREE_COLORS = {
     "Blue":   discord.Color.from_rgb(88,  101, 242),
     "Red":    discord.Color.from_rgb(237,  66,  69),
     "Green":  discord.Color.from_rgb(87,  242, 135),
 }
 
-# Premium color options (includes free + extras)
+# Premium color options (includes free + extras = 10 total)
 PREMIUM_COLORS = {
     **FREE_COLORS,
     "Gold":   discord.Color.from_rgb(255, 184,  28),
@@ -33,6 +33,8 @@ PREMIUM_COLORS = {
     "Cyan":   discord.Color.from_rgb(26,  188, 156),
     "Orange": discord.Color.from_rgb(230, 126,  34),
     "Brown":  discord.Color.from_rgb(152, 101,  60),
+    "Pink":   discord.Color.from_rgb(233,  30, 140),
+    "Olive":  discord.Color.from_rgb(128, 128,   0),
 }
 
 
@@ -106,10 +108,10 @@ def build_event_embed(event: dict, rsvps: dict) -> discord.Embed:
         return "\n".join(names) if names else "*None yet*"
 
     # Use custom button labels as field headers if available
-    accept_label   = event.get("btn_accept_label")    or "✅ Accepted"
+    accept_label    = event.get("btn_accept_label")    or "✅ Accepted"
     tentative_label = event.get("btn_tentative_label") or "❓ Tentative"
-    decline_label  = event.get("btn_decline_label")   or "❌ Declined"
-    show_tentative = bool(event.get("btn_tentative_enabled", 1))
+    decline_label   = event.get("btn_decline_label")   or "❌ Declined"
+    show_tentative  = bool(event.get("btn_tentative_enabled", 1))
 
     embed.add_field(
         name=f"{accept_label} ({len(accepted)})",
