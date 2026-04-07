@@ -14,6 +14,18 @@ Commands
 /cancelevent       — Soft cancel an event
 /myevents          — List events the caller has RSVPed to
 /exportevents      — Export upcoming events as a .ics calendar file
+
+Event creation flow
+-------------------
+Step 1 — What type of event?        (RecurrenceSelectView)
+Step 2 — What timezone?             (TimezoneSelectView)
+Step 3 — Mention/remind a role?     (RolePingSelectView)
+  └─ Yes → single-field modal       (RoleInputModal) → Step 4
+  └─ No  → skip reminder entirely   → Step 4
+Step 4 — Fill in event details      (NewEventModal)
+  Fields: Title · Description · Start · End · custom interval (conditional)
+  Notify Role field removed — handled in Step 3.
+  If no role was set, reminder_offset defaults to 15 min silently.
 """
 
 import discord
@@ -37,11 +49,6 @@ log = logging.getLogger("soren.events")
 
 
 def _parse_datetime(raw: str, tz_name: str) -> datetime | None:
-    """
-    Parse a date/time string in any reasonable format.
-    Tries strict YYYY-MM-DD HH:MM first, then falls back to dateparser.
-    Returns a timezone-aware datetime or None if parsing fails.
-    """
     tz = pytz.timezone(tz_name)
     try:
         return tz.localize(datetime.strptime(raw.strip(), "%Y-%m-%d %H:%M"))
@@ -60,7 +67,6 @@ def _parse_datetime(raw: str, tz_name: str) -> datetime | None:
     return None
 
 
-# ── Try to import relativedelta for monthly math ──────────────────────────────
 try:
     from dateutil.relativedelta import relativedelta
     HAS_DATEUTIL = True
@@ -68,13 +74,11 @@ except ImportError:
     HAS_DATEUTIL = False
 
 # ── Tier event limits ─────────────────────────────────────────────────────────
-FREE_EVENT_LIMIT    = 10   # Max active (upcoming) events for free servers
-PREMIUM_EVENT_LIMIT = 50   # Max active (upcoming) events for premium servers
+FREE_EVENT_LIMIT    = 10
+PREMIUM_EVENT_LIMIT = 50
 
-# ── RSVP cooldown tracking (in-memory, per user per event) ───────────────────
-# key: (user_id, event_id) → timestamp of last interaction
-_rsvp_cooldowns: dict[tuple, datetime] = {}
-RSVP_COOLDOWN_SECONDS = 3
+# ── Default reminder offset ───────────────────────────────────────────────────
+DEFAULT_REMINDER_OFFSET = 15  # minutes — used when no role is set
 
 # ── Timezone options ──────────────────────────────────────────────────────────
 TIMEZONES = [
@@ -93,17 +97,6 @@ TIMEZONES = [
     discord.SelectOption(label="Tokyo (JST)",                 value="Asia/Tokyo",          emoji="🇯🇵", description="Asia/Tokyo"),
     discord.SelectOption(label="New Delhi (IST)",             value="Asia/Kolkata",        emoji="🇮🇳", description="Asia/Kolkata"),
     discord.SelectOption(label="UTC",                         value="UTC",                 emoji="🌐", description="Coordinated Universal Time"),
-]
-
-# ── Reminder offset options ───────────────────────────────────────────────────
-REMINDER_OPTIONS = [
-    discord.SelectOption(label="15 minutes before", value="15",     emoji="⏰"),
-    discord.SelectOption(label="30 minutes before", value="30",     emoji="⏰"),
-    discord.SelectOption(label="45 minutes before", value="45",     emoji="⏰"),
-    discord.SelectOption(label="1 hour before",     value="60",     emoji="⏰"),
-    discord.SelectOption(label="2 hours before",    value="120",    emoji="⏰"),
-    discord.SelectOption(label="Custom",            value="custom", emoji="⚙️",
-                         description="Enter a custom number of minutes in the form"),
 ]
 
 # ── Recurrence options ────────────────────────────────────────────────────────
@@ -127,11 +120,26 @@ RECUR_LABELS = {
     "custom":    "Custom",
 }
 
+# ── Role ping yes/no options ──────────────────────────────────────────────────
+ROLE_PING_OPTIONS = [
+    discord.SelectOption(
+        label="Yes — mention a role",
+        value="yes",
+        emoji="🔔",
+        description="Ping a role when the event posts and at reminder time",
+    ),
+    discord.SelectOption(
+        label="No — skip role mention",
+        value="no",
+        emoji="🔕",
+        description="No role ping — go straight to event details",
+    ),
+]
+
 
 # ── Autocomplete helpers ──────────────────────────────────────────────────────
 
 async def autocomplete_event_ids(ctx: discord.AutocompleteContext):
-    """Autocomplete for event IDs, showing ID: Title. Includes events from today onwards."""
     now = datetime.now(timezone.utc)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     with get_connection() as conn:
@@ -155,21 +163,16 @@ def build_listevents_embed(rows, guild):
             ts = row["start_time"]
         recur_tag = f"  🔁 {RECUR_LABELS.get(row['recur_rule'], row['recur_rule'])}" if row["is_recurring"] else ""
         ch = guild.get_channel(row["channel_id"])
-        ch_str = ch.mention if ch else "unknown channel"
         embed.add_field(
             name=f"[ID: {row['id']}]  {row['title']}{recur_tag}",
-            value=f"🕐 {ts}  •  {ch_str}",
+            value=f"🕐 {ts}  •  {ch.mention if ch else 'unknown channel'}",
             inline=False,
         )
     return embed
 
 
 def get_guild_event_count(guild_id: int) -> int:
-    """
-    Count only upcoming (active) events for this guild.
-    Past events do not count against the limit — a server that has run
-    50 events historically should not be blocked from creating new ones.
-    """
+    """Count only upcoming (active) events. Past events don't count against the limit."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         row = conn.execute(
@@ -203,11 +206,7 @@ def compute_next_start(start_iso: str, recur_rule: str, recur_interval: int) -> 
 
 
 async def post_event_embed(channel: discord.TextChannel, event_data: dict):
-    """
-    Build and post the event embed. Saves message_id back to DB.
-    If a notify_role_id is set, pings that role alongside the embed
-    so the server knows a new event has been created.
-    """
+    """Build and post the event embed. Pings notify_role on creation if set."""
     from cogs.rsvp import EventView
     cfg = get_guild_config(channel.guild.id)
     event_data = {**event_data, "embed_color": cfg.get("embed_color") if cfg else None}
@@ -215,7 +214,6 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict):
     embed = build_event_embed(event_data, rsvps)
     view  = EventView(event_id=event_data["id"], event=event_data)
 
-    # ── Creation ping: mention the notify role when the event is first posted ──
     ping_content = None
     if event_data.get("notify_role_id"):
         role = channel.guild.get_role(event_data["notify_role_id"])
@@ -230,9 +228,8 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict):
 
 async def repost_recurring_embed(bot: discord.Bot, event_id: int):
     """
-    Called after a recurring event advances to its next occurrence.
-    Deletes the old embed and posts a fresh one with the updated time.
-    The notify_role is NOT pinged on auto-respawn — only on manual creation.
+    Deletes the old embed and posts a fresh one after a recurring event advances.
+    No role ping on auto-respawn — only on manual creation.
     """
     from cogs.rsvp import EventView
     with get_connection() as conn:
@@ -248,7 +245,6 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
     if not channel:
         return
 
-    # Delete the old embed
     if event.get("message_id"):
         try:
             old_msg = await channel.fetch_message(event["message_id"])
@@ -256,7 +252,6 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
         except (discord.NotFound, discord.Forbidden):
             pass
 
-    # Post a fresh embed — no ping on auto-respawn
     cfg = get_guild_config(guild.id)
     event = {**event, "embed_color": cfg.get("embed_color") if cfg else None}
     rsvps = {"accepted": [], "declined": [], "tentative": []}
@@ -273,9 +268,15 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
         log.warning(f"repost_recurring_embed: no permission in channel {channel.id}")
 
 
-# ── New Event Modal (Step 4) ──────────────────────────────────────────────────
+# ── Step 4 — Event detail modal ───────────────────────────────────────────────
 
 class NewEventModal(discord.ui.Modal):
+    """
+    Final step of /newevent.
+    notify_role_id and reminder_offset are passed in from earlier steps.
+    5th slot is only used for custom recurrence interval.
+    """
+
     def __init__(self, channel: discord.TextChannel, recur_rule: str,
                  tz_name: str, reminder_offset: int,
                  notify_role_id: int | None = None, *args, **kwargs):
@@ -292,17 +293,12 @@ class NewEventModal(discord.ui.Modal):
         self.add_item(discord.ui.InputText(label="End Date & Time (optional)", placeholder="2026-07-04 21:00  or  July 4 9pm", required=False, max_length=50))
         if recur_rule == "custom":
             self.add_item(discord.ui.InputText(label="Repeat Interval (days)", placeholder="e.g. 14 for every 2 weeks", max_length=4))
-        elif reminder_offset == -1:
-            self.add_item(discord.ui.InputText(label="Custom Reminder (minutes before start)", placeholder="e.g. 90 for 1.5 hours before", max_length=4))
-        else:
-            self.add_item(discord.ui.InputText(label="Notify Role (optional)", placeholder="Role name, @Role, or role ID", required=False, max_length=100))
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild_id = interaction.guild.id
         premium  = is_premium(guild_id)
 
-        # ── Tier-aware active event cap ───────────────────────────────────
         active_count = get_guild_event_count(guild_id)
         if premium and active_count >= PREMIUM_EVENT_LIMIT:
             await interaction.followup.send(
@@ -337,11 +333,6 @@ class NewEventModal(discord.ui.Modal):
                 recur_interval = max(1, int(self.children[4].value.strip()))
             except ValueError:
                 recur_interval = 7
-        elif self.reminder_offset == -1 and len(self.children) > 4:
-            try:
-                reminder_offset = max(1, int(self.children[4].value.strip()))
-            except ValueError:
-                reminder_offset = 15
 
         start_dt = _parse_datetime(start_raw, self.tz_name)
         if not start_dt:
@@ -360,26 +351,9 @@ class NewEventModal(discord.ui.Modal):
 
         is_recurring = 0 if self.recur_rule == "none" else 1
 
-        # Warn if timezone defaulted to UTC without explicit selection
         tz_warning = ""
         if self.tz_name == "UTC":
             tz_warning = "\n⚠️ Event was created in **UTC**. Use `/editeventtime` to change the timezone if needed."
-
-        notify_role_id = self.notify_role_id
-        if self.recur_rule != "custom" and self.reminder_offset != -1 and len(self.children) > 4:
-            role_raw = self.children[4].value.strip() if self.children[4].value else ""
-            if role_raw:
-                try:
-                    role = interaction.guild.get_role(int(role_raw))
-                    if role:
-                        notify_role_id = role.id
-                except ValueError:
-                    clean = role_raw.lstrip("@").strip()
-                    role = discord.utils.find(lambda r: r.name.lower() == clean.lower(), interaction.guild.roles)
-                    if role:
-                        notify_role_id = role.id
-                    else:
-                        log.warning(f"Could not find role '{role_raw}' in guild {interaction.guild.id}")
 
         with get_connection() as conn:
             cursor = conn.execute(
@@ -392,7 +366,8 @@ class NewEventModal(discord.ui.Modal):
                 """,
                 (guild_id, self.target_channel.id, interaction.user.id,
                  title, description, self.tz_name, start_iso, end_iso,
-                 is_recurring, self.recur_rule, recur_interval, reminder_offset, notify_role_id),
+                 is_recurring, self.recur_rule, recur_interval,
+                 reminder_offset, self.notify_role_id),
             )
             event_id = cursor.lastrowid
             conn.commit()
@@ -402,7 +377,7 @@ class NewEventModal(discord.ui.Modal):
             "timezone": self.tz_name, "start_time": start_iso, "end_time": end_iso,
             "is_recurring": is_recurring, "recur_rule": self.recur_rule,
             "recur_interval": recur_interval, "channel_id": self.target_channel.id,
-            "reminder_offset": reminder_offset, "notify_role_id": notify_role_id,
+            "reminder_offset": reminder_offset, "notify_role_id": self.notify_role_id,
             "btn_accept_label": "✅ Accept", "btn_decline_label": "❌ Decline",
             "btn_tentative_label": "❓ Tentative", "btn_tentative_enabled": 1,
         }
@@ -424,31 +399,111 @@ class NewEventModal(discord.ui.Modal):
         )
 
 
-# ── Reminder selector (Step 3) ────────────────────────────────────────────────
+# ── Step 3b — Role input modal (Yes path only) ────────────────────────────────
 
-class ReminderSelectView(discord.ui.View):
-    def __init__(self, channel, author_id, recur_rule, tz_name):
+class RoleInputModal(discord.ui.Modal):
+    """
+    Single-field modal shown when the user picks Yes on the role ping step.
+    Resolves the role, then opens NewEventModal.
+    """
+
+    def __init__(self, channel: discord.TextChannel, recur_rule: str,
+                 tz_name: str, *args, **kwargs):
+        super().__init__(title="Set Mention & Reminder Role", *args, **kwargs)
+        self.channel    = channel
+        self.recur_rule = recur_rule
+        self.tz_name    = tz_name
+
+        self.add_item(discord.ui.InputText(
+            label="Role name, @Role, or role ID",
+            placeholder="e.g.  Members  or  @Events  or  123456789",
+            max_length=100,
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        role_raw       = self.children[0].value.strip()
+        notify_role_id = None
+
+        if role_raw:
+            try:
+                role = interaction.guild.get_role(int(role_raw))
+                if role:
+                    notify_role_id = role.id
+            except ValueError:
+                clean = role_raw.lstrip("@").strip()
+                role  = discord.utils.find(
+                    lambda r: r.name.lower() == clean.lower(),
+                    interaction.guild.roles,
+                )
+                if role:
+                    notify_role_id = role.id
+
+        if not notify_role_id:
+            log.warning(
+                f"RoleInputModal: could not resolve role '{role_raw}' "
+                f"in guild {interaction.guild.id} — proceeding without role"
+            )
+
+        await interaction.response.send_modal(
+            NewEventModal(
+                channel=self.channel,
+                recur_rule=self.recur_rule,
+                tz_name=self.tz_name,
+                reminder_offset=DEFAULT_REMINDER_OFFSET,
+                notify_role_id=notify_role_id,
+            )
+        )
+
+
+# ── Step 3 — Role ping selector ───────────────────────────────────────────────
+
+class RolePingSelectView(discord.ui.View):
+    """
+    Step 3 of /newevent.
+    Yes → RoleInputModal (single field) → NewEventModal.
+    No  → NewEventModal directly, no role, reminder silently defaults to 15 min.
+    """
+
+    def __init__(self, channel: discord.TextChannel, author_id: int,
+                 recur_rule: str, tz_name: str):
         super().__init__(timeout=60)
         self.channel    = channel
         self.author_id  = author_id
         self.recur_rule = recur_rule
         self.tz_name    = tz_name
 
-    @discord.ui.select(placeholder="Choose reminder timing...", options=REMINDER_OPTIONS)
-    async def reminder_select(self, select, interaction):
+    @discord.ui.select(placeholder="Mention / remind a role?", options=ROLE_PING_OPTIONS)
+    async def role_ping_select(self, select: discord.ui.Select, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Only the person who ran `/newevent` can use this menu.", ephemeral=True)
+            await interaction.response.send_message(
+                "Only the person who ran `/newevent` can use this menu.", ephemeral=True
+            )
             return
+
         self.stop()
-        value = select.values[0]
-        reminder_offset = -1 if value == "custom" else int(value)
-        await interaction.response.send_modal(
-            NewEventModal(channel=self.channel, recur_rule=self.recur_rule,
-                          tz_name=self.tz_name, reminder_offset=reminder_offset)
-        )
+
+        if select.values[0] == "yes":
+            await interaction.response.send_modal(
+                RoleInputModal(
+                    channel=self.channel,
+                    recur_rule=self.recur_rule,
+                    tz_name=self.tz_name,
+                )
+            )
+        else:
+            # No role — skip reminder, go straight to detail modal
+            await interaction.response.send_modal(
+                NewEventModal(
+                    channel=self.channel,
+                    recur_rule=self.recur_rule,
+                    tz_name=self.tz_name,
+                    reminder_offset=DEFAULT_REMINDER_OFFSET,
+                    notify_role_id=None,
+                )
+            )
 
 
-# ── Timezone selector (Step 2) ────────────────────────────────────────────────
+# ── Step 2 — Timezone selector ────────────────────────────────────────────────
 
 class TimezoneSelectView(discord.ui.View):
     def __init__(self, channel, author_id, recur_rule):
@@ -460,17 +515,32 @@ class TimezoneSelectView(discord.ui.View):
     @discord.ui.select(placeholder="Choose your timezone...", options=TIMEZONES)
     async def tz_select(self, select, interaction):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Only the person who ran `/newevent` can use this menu.", ephemeral=True)
+            await interaction.response.send_message(
+                "Only the person who ran `/newevent` can use this menu.", ephemeral=True
+            )
             return
         self.stop()
         await interaction.response.edit_message(
-            embed=discord.Embed(title="📅  New Event — Step 3 of 4", description="**When should the reminder be sent?**", color=COLOR_EVENT),
-            view=ReminderSelectView(channel=self.channel, author_id=self.author_id,
-                                    recur_rule=self.recur_rule, tz_name=select.values[0]),
+            embed=discord.Embed(
+                title="📅  New Event — Step 3 of 4",
+                description=(
+                    "**Do you want to mention and remind a role?**\n\n"
+                    "🔔 **Yes** — A role will be pinged when the event posts "
+                    "and again when the reminder fires.\n"
+                    "🔕 **No** — No role ping. Skip straight to event details."
+                ),
+                color=COLOR_EVENT,
+            ),
+            view=RolePingSelectView(
+                channel=self.channel,
+                author_id=self.author_id,
+                recur_rule=self.recur_rule,
+                tz_name=select.values[0],
+            ),
         )
 
 
-# ── Recurrence selector (Step 1) ─────────────────────────────────────────────
+# ── Step 1 — Recurrence selector ─────────────────────────────────────────────
 
 class RecurrenceSelectView(discord.ui.View):
     def __init__(self, channel, author_id):
@@ -481,12 +551,22 @@ class RecurrenceSelectView(discord.ui.View):
     @discord.ui.select(placeholder="Choose event type...", options=RECUR_OPTIONS)
     async def recur_select(self, select, interaction):
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Only the person who ran `/newevent` can use this menu.", ephemeral=True)
+            await interaction.response.send_message(
+                "Only the person who ran `/newevent` can use this menu.", ephemeral=True
+            )
             return
         self.stop()
         await interaction.response.edit_message(
-            embed=discord.Embed(title="📅  New Event — Step 2 of 4", description="**Choose your timezone.**", color=COLOR_EVENT),
-            view=TimezoneSelectView(channel=self.channel, author_id=self.author_id, recur_rule=select.values[0]),
+            embed=discord.Embed(
+                title="📅  New Event — Step 2 of 4",
+                description="**Choose your timezone.**",
+                color=COLOR_EVENT,
+            ),
+            view=TimezoneSelectView(
+                channel=self.channel,
+                author_id=self.author_id,
+                recur_rule=select.values[0],
+            ),
         )
 
 
@@ -496,39 +576,23 @@ class EditEventDetailsModal(discord.ui.Modal):
     """
     Edit title, description, max RSVPs, and notify role.
     Opened by /editeventdetails.
-    Fields: Title · Description · Max RSVPs · Notify Role  (4 of 5 slots used)
     """
 
     def __init__(self, event: dict, guild: discord.Guild, *args, **kwargs):
         super().__init__(title="Edit Event Details", *args, **kwargs)
         self.event = event
 
-        # Resolve current notify role name for pre-fill
         notify_role_value = ""
         if event.get("notify_role_id"):
             role = guild.get_role(event["notify_role_id"])
             if role:
                 notify_role_value = role.name
 
+        self.add_item(discord.ui.InputText(label="Event Title", value=event["title"], max_length=100))
+        self.add_item(discord.ui.InputText(label="Description (optional)", value=event.get("description") or "", style=discord.InputTextStyle.paragraph, required=False, max_length=500))
+        self.add_item(discord.ui.InputText(label="Max RSVPs (0 = unlimited)", value=str(event.get("max_rsvp") or 0), max_length=6))
         self.add_item(discord.ui.InputText(
-            label="Event Title",
-            value=event["title"],
-            max_length=100,
-        ))
-        self.add_item(discord.ui.InputText(
-            label="Description (optional)",
-            value=event.get("description") or "",
-            style=discord.InputTextStyle.paragraph,
-            required=False,
-            max_length=500,
-        ))
-        self.add_item(discord.ui.InputText(
-            label="Max RSVPs (0 = unlimited)",
-            value=str(event.get("max_rsvp") or 0),
-            max_length=6,
-        ))
-        self.add_item(discord.ui.InputText(
-            label="Notify Role (optional)",
+            label="Mention & Reminder Role (optional)",
             value=notify_role_value,
             placeholder="Role name, @Role, or role ID — leave blank to clear",
             required=False,
@@ -537,7 +601,6 @@ class EditEventDetailsModal(discord.ui.Modal):
 
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
-
         await interaction.response.defer(ephemeral=True)
 
         title        = self.children[0].value.strip()
@@ -550,17 +613,19 @@ class EditEventDetailsModal(discord.ui.Modal):
         except ValueError:
             max_rsvp = 0
 
-        # Resolve notify role — keep existing if field left blank
-        notify_role_id = self.event.get("notify_role_id")
         if role_raw:
+            notify_role_id = None
             try:
                 role = interaction.guild.get_role(int(role_raw))
                 if role:
                     notify_role_id = role.id
             except ValueError:
                 clean = role_raw.lstrip("@").strip()
-                role = discord.utils.find(lambda r: r.name.lower() == clean.lower(), interaction.guild.roles)
-                notify_role_id = role.id if role else notify_role_id
+                role  = discord.utils.find(lambda r: r.name.lower() == clean.lower(), interaction.guild.roles)
+                if role:
+                    notify_role_id = role.id
+        else:
+            notify_role_id = None  # blank = clear the role
 
         with get_connection() as conn:
             conn.execute(
@@ -569,54 +634,26 @@ class EditEventDetailsModal(discord.ui.Modal):
             )
             conn.commit()
 
-        await interaction.followup.send(
-            embed=build_success_embed(f"Details updated for **{title}**."),
-            ephemeral=True,
-        )
+        await interaction.followup.send(embed=build_success_embed(f"Details updated for **{title}**."), ephemeral=True)
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
 
 
 # ── Edit Event Time Modal ─────────────────────────────────────────────────────
 
 class EditEventTimeModal(discord.ui.Modal):
-    """
-    Edit start time, end time, timezone, and reminder offset.
-    Opened by /editeventtime.
-    Fields: Start · End · Timezone · Reminder  (4 of 5 slots used)
-    """
+    """Edit start time, end time, timezone, and reminder offset."""
 
     def __init__(self, event: dict, *args, **kwargs):
         super().__init__(title="Edit Event Time", *args, **kwargs)
         self.event = event
 
-        self.add_item(discord.ui.InputText(
-            label="Start Date & Time",
-            value=event["start_time"][:16].replace("T", " "),
-            placeholder="2026-07-04 20:00  or  July 4 8pm",
-            max_length=50,
-        ))
-        self.add_item(discord.ui.InputText(
-            label="End Date & Time (optional)",
-            value=event.get("end_time", "")[:16].replace("T", " ") if event.get("end_time") else "",
-            placeholder="Leave blank for no end time",
-            required=False,
-            max_length=50,
-        ))
-        self.add_item(discord.ui.InputText(
-            label="Timezone",
-            value=event.get("timezone") or "UTC",
-            placeholder="e.g. America/New_York, UTC, Europe/London",
-            max_length=50,
-        ))
-        self.add_item(discord.ui.InputText(
-            label="Reminder (minutes before start)",
-            value=str(event.get("reminder_offset") or 15),
-            max_length=4,
-        ))
+        self.add_item(discord.ui.InputText(label="Start Date & Time", value=event["start_time"][:16].replace("T", " "), placeholder="2026-07-04 20:00  or  July 4 8pm", max_length=50))
+        self.add_item(discord.ui.InputText(label="End Date & Time (optional)", value=event.get("end_time", "")[:16].replace("T", " ") if event.get("end_time") else "", placeholder="Leave blank for no end time", required=False, max_length=50))
+        self.add_item(discord.ui.InputText(label="Timezone", value=event.get("timezone") or "UTC", placeholder="e.g. America/New_York, UTC, Europe/London", max_length=50))
+        self.add_item(discord.ui.InputText(label="Reminder (minutes before start)", value=str(event.get("reminder_offset") or 15), max_length=4))
 
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
-
         await interaction.response.defer(ephemeral=True)
 
         start_raw    = self.children[0].value.strip()
@@ -626,11 +663,7 @@ class EditEventTimeModal(discord.ui.Modal):
 
         if tz_name not in pytz.all_timezones:
             await interaction.followup.send(
-                embed=build_error_embed(
-                    f"Unknown timezone: `{tz_name}`.\n"
-                    "Use a standard tz name like `America/New_York`, `Europe/London`, or `UTC`.\n"
-                    "Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
-                ),
+                embed=build_error_embed(f"Unknown timezone: `{tz_name}`.\nUse a standard tz name like `America/New_York`, `Europe/London`, or `UTC`."),
                 ephemeral=True,
             )
             return
@@ -642,12 +675,7 @@ class EditEventTimeModal(discord.ui.Modal):
 
         start_dt = _parse_datetime(start_raw, tz_name)
         if not start_dt:
-            await interaction.followup.send(
-                embed=build_error_embed(
-                    "Couldn't parse the start date/time. Try `2026-07-04 20:00` or `July 4 8pm`."
-                ),
-                ephemeral=True,
-            )
+            await interaction.followup.send(embed=build_error_embed("Couldn't parse the start date/time. Try `2026-07-04 20:00` or `July 4 8pm`."), ephemeral=True)
             return
         start_iso = start_dt.isoformat()
 
@@ -655,10 +683,7 @@ class EditEventTimeModal(discord.ui.Modal):
         if end_raw:
             end_dt = _parse_datetime(end_raw, tz_name)
             if not end_dt:
-                await interaction.followup.send(
-                    embed=build_error_embed("Couldn't parse the end date/time."),
-                    ephemeral=True,
-                )
+                await interaction.followup.send(embed=build_error_embed("Couldn't parse the end date/time."), ephemeral=True)
                 return
             end_iso = end_dt.isoformat()
 
@@ -669,23 +694,14 @@ class EditEventTimeModal(discord.ui.Modal):
             )
             conn.commit()
 
-        await interaction.followup.send(
-            embed=build_success_embed(f"Time updated for **{self.event['title']}**."),
-            ephemeral=True,
-        )
+        await interaction.followup.send(embed=build_success_embed(f"Time updated for **{self.event['title']}**."), ephemeral=True)
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
 
 
 # ── Event Buttons Modal ───────────────────────────────────────────────────────
 
 class EventButtonsModal(discord.ui.Modal):
-    """
-    Free servers: toggle Tentative button on/off only.
-    Premium servers: toggle Tentative + set custom labels for all three buttons.
-
-    Free modal  (2 of 5 slots): Show Tentative · Accept Label (read-only hint)
-    Premium modal (4 of 5 slots): Show Tentative · Accept Label · Tentative Label · Decline Label
-    """
+    """Free: toggle Tentative only. Premium: toggle + custom labels."""
 
     def __init__(self, event: dict, premium: bool, *args, **kwargs):
         super().__init__(title="Button Settings", *args, **kwargs)
@@ -693,39 +709,14 @@ class EventButtonsModal(discord.ui.Modal):
         self.premium = premium
 
         current = "yes" if event.get("btn_tentative_enabled", 1) else "no"
-
-        # Field 1 — always shown (free + premium)
-        self.add_item(discord.ui.InputText(
-            label="Show Tentative Button? (yes / no)",
-            value=current,
-            max_length=3,
-        ))
+        self.add_item(discord.ui.InputText(label="Show Tentative Button? (yes / no)", value=current, max_length=3))
 
         if premium:
-            # Fields 2–4 — custom labels (premium only)
-            self.add_item(discord.ui.InputText(
-                label="Accept Button Label",
-                value=event.get("btn_accept_label") or "✅ Accept",
-                max_length=20,
-            ))
-            self.add_item(discord.ui.InputText(
-                label="Tentative Button Label",
-                value=event.get("btn_tentative_label") or "❓ Tentative",
-                max_length=20,
-            ))
-            self.add_item(discord.ui.InputText(
-                label="Decline Button Label",
-                value=event.get("btn_decline_label") or "❌ Decline",
-                max_length=20,
-            ))
+            self.add_item(discord.ui.InputText(label="Accept Button Label",   value=event.get("btn_accept_label")    or "✅ Accept",    max_length=20))
+            self.add_item(discord.ui.InputText(label="Tentative Button Label", value=event.get("btn_tentative_label") or "❓ Tentative", max_length=20))
+            self.add_item(discord.ui.InputText(label="Decline Button Label",   value=event.get("btn_decline_label")   or "❌ Decline",   max_length=20))
         else:
-            # Show a read-only hint so free users know labels exist as a premium feature
-            self.add_item(discord.ui.InputText(
-                label="Custom Labels (⭐ Premium only)",
-                value="Upgrade to Premium to set custom button labels.",
-                required=False,
-                max_length=50,
-            ))
+            self.add_item(discord.ui.InputText(label="Custom Labels (⭐ Premium only)", value="Upgrade to Premium to set custom button labels.", required=False, max_length=50))
 
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
@@ -738,7 +729,6 @@ class EventButtonsModal(discord.ui.Modal):
             tentative_label = self.children[2].value.strip() or "❓ Tentative"
             decline_label   = self.children[3].value.strip() or "❌ Decline"
         else:
-            # Keep existing labels unchanged for free servers
             accept_label    = self.event.get("btn_accept_label")    or "✅ Accept"
             tentative_label = self.event.get("btn_tentative_label") or "❓ Tentative"
             decline_label   = self.event.get("btn_decline_label")   or "❌ Decline"
@@ -750,12 +740,10 @@ class EventButtonsModal(discord.ui.Modal):
             )
             conn.commit()
 
-        state = "visible" if show_tentative else "hidden"
+        state      = "visible" if show_tentative else "hidden"
         label_note = " Labels updated." if self.premium else ""
         await interaction.response.send_message(
-            embed=build_success_embed(
-                f"Updated **{self.event['title']}** — Tentative button is now **{state}**.{label_note}"
-            ),
+            embed=build_success_embed(f"Updated **{self.event['title']}** — Tentative button is now **{state}**.{label_note}"),
             ephemeral=True,
         )
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
@@ -764,8 +752,6 @@ class EventButtonsModal(discord.ui.Modal):
 # ── Delete confirmation view ──────────────────────────────────────────────────
 
 class DeleteConfirmView(discord.ui.View):
-    """Two-button confirmation before permanently deleting an event."""
-
     def __init__(self, event: dict, author_id: int):
         super().__init__(timeout=30)
         self.event     = event
@@ -780,23 +766,20 @@ class DeleteConfirmView(discord.ui.View):
     @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger)
     async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
         self.stop()
-        event = self.event
-
         try:
-            guild   = interaction.guild
-            ch      = guild.get_channel(event["channel_id"])
-            if ch and event.get("message_id"):
-                msg = await ch.fetch_message(event["message_id"])
+            ch = interaction.guild.get_channel(self.event["channel_id"])
+            if ch and self.event.get("message_id"):
+                msg = await ch.fetch_message(self.event["message_id"])
                 await msg.delete()
         except discord.NotFound:
             pass
 
         with get_connection() as conn:
-            conn.execute("DELETE FROM events WHERE id=?", (event["id"],))
+            conn.execute("DELETE FROM events WHERE id=?", (self.event["id"],))
             conn.commit()
 
         await interaction.response.edit_message(
-            embed=build_success_embed(f"Event **{event['title']}** (ID: `{event['id']}`) has been deleted."),
+            embed=build_success_embed(f"Event **{self.event['title']}** (ID: `{self.event['id']}`) has been deleted."),
             view=None,
         )
 
@@ -812,8 +795,6 @@ class DeleteConfirmView(discord.ui.View):
 # ── Waitlist RSVP view ────────────────────────────────────────────────────────
 
 class WaitlistView(discord.ui.View):
-    """Shown when an event is full. Offers to join the waitlist."""
-
     def __init__(self, event_id: int):
         super().__init__(timeout=60)
         self.event_id = event_id
@@ -828,23 +809,17 @@ class WaitlistView(discord.ui.View):
             if existing:
                 await interaction.response.send_message("You're already on the waitlist for this event.", ephemeral=True)
                 return
-            conn.execute(
-                "INSERT INTO waitlist (event_id, user_id) VALUES (?, ?)",
-                (self.event_id, interaction.user.id),
-            )
+            conn.execute("INSERT INTO waitlist (event_id, user_id) VALUES (?, ?)", (self.event_id, interaction.user.id))
             conn.commit()
 
-        # Get position
         with get_connection() as conn:
             pos = conn.execute(
-                "SELECT COUNT(*) as cnt FROM waitlist WHERE event_id=? AND user_id <= (SELECT id FROM waitlist WHERE event_id=? AND user_id=?)",
+                "SELECT COUNT(*) as cnt FROM waitlist WHERE event_id=? AND id <= "
+                "(SELECT id FROM waitlist WHERE event_id=? AND user_id=?)",
                 (self.event_id, self.event_id, interaction.user.id),
             ).fetchone()["cnt"]
 
-        await interaction.response.send_message(
-            f"✅ You've been added to the waitlist! You are **#{pos}** in line.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"✅ You've been added to the waitlist! You are **#{pos}** in line.", ephemeral=True)
 
 
 # ── List Events paginator ─────────────────────────────────────────────────────
@@ -906,12 +881,9 @@ class ListEventsView(discord.ui.View):
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Events(commands.Cog):
-    """Core event management commands."""
-
     def __init__(self, bot: discord.Bot):
         self.bot = bot
 
-    # ── /newevent ─────────────────────────────────────────────────────────
     @discord.slash_command(name="newevent", description="Create a new event.")
     async def newevent(
         self,
@@ -932,7 +904,6 @@ class Events(commands.Cog):
         )
         await ctx.respond(embed=embed, view=RecurrenceSelectView(channel=channel, author_id=ctx.author.id), ephemeral=True)
 
-    # ── /editeventdetails ─────────────────────────────────────────────────
     @discord.slash_command(name="editeventdetails", description="Edit an event's title, description, max RSVPs, or notify role.")
     async def editeventdetails(
         self,
@@ -949,7 +920,6 @@ class Events(commands.Cog):
             return
         await ctx.send_modal(EditEventDetailsModal(event=dict(row), guild=ctx.guild))
 
-    # ── /editeventtime ────────────────────────────────────────────────────
     @discord.slash_command(name="editeventtime", description="Edit an event's start/end time, timezone, or reminder.")
     async def editeventtime(
         self,
@@ -966,7 +936,6 @@ class Events(commands.Cog):
             return
         await ctx.send_modal(EditEventTimeModal(event=dict(row)))
 
-    # ── /deleteevent ──────────────────────────────────────────────────────
     @discord.slash_command(name="deleteevent", description="Delete an event permanently.")
     async def deleteevent(
         self,
@@ -981,7 +950,6 @@ class Events(commands.Cog):
         if not row:
             await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
             return
-
         event = dict(row)
         embed = discord.Embed(
             title="⚠️  Confirm Deletion",
@@ -990,13 +958,10 @@ class Events(commands.Cog):
         )
         await ctx.respond(embed=embed, view=DeleteConfirmView(event=event, author_id=ctx.author.id), ephemeral=True)
 
-    # ── /listevents ───────────────────────────────────────────────────────
     @discord.slash_command(name="listevents", description="List all upcoming events in this server.")
     async def listevents(self, ctx: discord.ApplicationContext):
         now = datetime.now(timezone.utc)
-        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_iso = start_of_day.isoformat()
-
+        start_iso = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         with get_connection() as conn:
             rows = conn.execute(
                 "SELECT id, title, start_time, timezone, channel_id, is_recurring, recur_rule FROM events WHERE guild_id=? AND start_time >= ? ORDER BY start_time ASC",
@@ -1011,7 +976,6 @@ class Events(commands.Cog):
             view = ListEventsView(rows, ctx.guild, ctx.author.id)
             await ctx.respond(embed=view._build_embed(), view=view, ephemeral=True)
 
-    # ── /eventbuttons ─────────────────────────────────────────────────────
     @discord.slash_command(name="eventbuttons", description="Customize RSVP button labels and toggle the Tentative button.")
     async def eventbuttons(
         self,
@@ -1026,11 +990,8 @@ class Events(commands.Cog):
         if not row:
             await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
             return
+        await ctx.send_modal(EventButtonsModal(event=dict(row), premium=is_premium(ctx.guild.id)))
 
-        premium = is_premium(ctx.guild.id)
-        await ctx.send_modal(EventButtonsModal(event=dict(row), premium=premium))
-
-    # ── /cancelevent ──────────────────────────────────────────────────────
     @discord.slash_command(name="cancelevent", description="Soft cancel an event (marks as cancelled without deleting).")
     async def cancelevent(
         self,
@@ -1045,38 +1006,26 @@ class Events(commands.Cog):
         if not row:
             await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
             return
-
         event = dict(row)
-
         if event["title"].startswith("[CANCELLED]"):
-            await ctx.respond(
-                embed=build_error_embed("This event has already been cancelled."),
-                ephemeral=True,
-            )
+            await ctx.respond(embed=build_error_embed("This event has already been cancelled."), ephemeral=True)
             return
-
-        cancelled_title = f"[CANCELLED] {event['title']}"
-        cancelled_desc  = (event.get("description") or "") + "\n\n*This event has been cancelled.*"
         with get_connection() as conn:
-            conn.execute("UPDATE events SET title=?, description=? WHERE id=?", (cancelled_title, cancelled_desc, event_id))
+            conn.execute(
+                "UPDATE events SET title=?, description=? WHERE id=?",
+                (f"[CANCELLED] {event['title']}", (event.get("description") or "") + "\n\n*This event has been cancelled.*", event_id),
+            )
             conn.commit()
-
         await ctx.respond(embed=build_success_embed(f"Event **{event['title']}** (ID: `{event_id}`) marked as cancelled."), ephemeral=True)
         from cogs.rsvp import refresh_event_embed
         await refresh_event_embed(event_id, ctx.guild, ctx.bot)
 
-    # ── /myevents ─────────────────────────────────────────────────────────
     @discord.slash_command(name="myevents", description="List events you've RSVPed to in this server.")
     async def myevents(self, ctx: discord.ApplicationContext):
         now_iso = datetime.now(timezone.utc).isoformat()
         with get_connection() as conn:
             rows = conn.execute(
-                """
-                SELECT e.id, e.title, e.start_time, e.timezone, e.channel_id, r.status
-                FROM rsvps r JOIN events e ON r.event_id = e.id
-                WHERE r.user_id=? AND e.guild_id=? AND e.start_time >= ? AND r.status IN ('accepted','tentative')
-                ORDER BY e.start_time ASC
-                """,
+                "SELECT e.id, e.title, e.start_time, e.timezone, e.channel_id, r.status FROM rsvps r JOIN events e ON r.event_id = e.id WHERE r.user_id=? AND e.guild_id=? AND e.start_time >= ? AND r.status IN ('accepted','tentative') ORDER BY e.start_time ASC",
                 (ctx.author.id, ctx.guild.id, now_iso),
             ).fetchall()
         if not rows:
@@ -1090,70 +1039,48 @@ class Events(commands.Cog):
                 ts = dt.strftime("%b %d, %Y  %I:%M %p %Z")
             except Exception:
                 ts = row["start_time"]
-            status_emoji = "✅" if row["status"] == "accepted" else "❓"
             ch = ctx.guild.get_channel(row["channel_id"])
-            embed.add_field(name=f"{status_emoji} {row['title']}", value=f"🕐 {ts}  •  {ch.mention if ch else 'unknown channel'}", inline=False)
+            embed.add_field(
+                name=f"{'✅' if row['status'] == 'accepted' else '❓'} {row['title']}",
+                value=f"🕐 {ts}  •  {ch.mention if ch else 'unknown channel'}",
+                inline=False,
+            )
         await ctx.respond(embed=embed, ephemeral=True)
 
-    # ── /exportevents ─────────────────────────────────────────────────────
     @discord.slash_command(name="exportevents", description="Export upcoming events as an .ics calendar file.")
     async def exportevents(self, ctx: discord.ApplicationContext):
-        """Generates a standard iCalendar (.ics) file for all upcoming events."""
         now_iso = datetime.now(timezone.utc).isoformat()
         with get_connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM events WHERE guild_id=? AND start_time >= ? ORDER BY start_time ASC",
                 (ctx.guild.id, now_iso),
             ).fetchall()
-
         if not rows:
             await ctx.respond(embed=build_error_embed("No upcoming events to export."), ephemeral=True)
             return
 
-        lines = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            f"PRODID:-//Soren//Discord Events//EN",
-            "CALSCALE:GREGORIAN",
-            "METHOD:PUBLISH",
-        ]
-
+        lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Soren//Discord Events//EN", "CALSCALE:GREGORIAN", "METHOD:PUBLISH"]
         for row in rows:
             event = dict(row)
             try:
-                tz   = pytz.timezone(event.get("timezone") or "UTC")
-                s_dt = datetime.fromisoformat(event["start_time"]).astimezone(pytz.utc)
+                s_dt    = datetime.fromisoformat(event["start_time"]).astimezone(pytz.utc)
                 dtstart = s_dt.strftime("%Y%m%dT%H%M%SZ")
-                if event.get("end_time"):
-                    e_dt   = datetime.fromisoformat(event["end_time"]).astimezone(pytz.utc)
-                    dtend  = e_dt.strftime("%Y%m%dT%H%M%SZ")
-                else:
-                    dtend  = (s_dt + timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
+                dtend   = (datetime.fromisoformat(event["end_time"]).astimezone(pytz.utc).strftime("%Y%m%dT%H%M%SZ") if event.get("end_time") else (s_dt + timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ"))
             except Exception:
                 continue
-
-            uid     = f"soren-event-{event['id']}@{ctx.guild.id}"
-            summary = event["title"].replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
-            desc    = (event.get("description") or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
-
             lines += [
                 "BEGIN:VEVENT",
-                f"UID:{uid}",
-                f"SUMMARY:{summary}",
-                f"DTSTART:{dtstart}",
-                f"DTEND:{dtend}",
-                f"DESCRIPTION:{desc}",
+                f"UID:soren-event-{event['id']}@{ctx.guild.id}",
+                f"SUMMARY:{event['title'].replace(chr(92), chr(92)*2).replace(';', chr(92)+';').replace(',', chr(92)+',')}",
+                f"DTSTART:{dtstart}", f"DTEND:{dtend}",
+                f"DESCRIPTION:{(event.get('description') or '').replace(chr(10), chr(92)+'n')}",
                 "END:VEVENT",
             ]
-
         lines.append("END:VCALENDAR")
-        ics_content = "\r\n".join(lines)
-        file = discord.File(io.BytesIO(ics_content.encode("utf-8")), filename=f"{ctx.guild.name}_events.ics")
-
+        file = discord.File(io.BytesIO("\r\n".join(lines).encode("utf-8")), filename=f"{ctx.guild.name}_events.ics")
         await ctx.respond(
             embed=build_success_embed(f"Exported **{len(rows)}** upcoming event(s). Import the attached file into any calendar app."),
-            file=file,
-            ephemeral=True,
+            file=file, ephemeral=True,
         )
 
 
