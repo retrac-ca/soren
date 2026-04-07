@@ -48,8 +48,9 @@ except ImportError:
 SCOPES     = ["https://www.googleapis.com/auth/calendar.readonly"]
 CREDS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 
-EVENTS_PER_PAGE   = 8
-FREE_GCAL_LIMIT   = 5
+EVENTS_PER_PAGE    = 8
+FREE_GCAL_LIMIT    = 2
+PREMIUM_GCAL_LIMIT = 20
 
 # Pending OAuth flows keyed by guild_id
 _pending_flows: dict[int, object] = {}
@@ -547,7 +548,28 @@ class GcalIntegrations(commands.Cog):
                         description=(
                             f"Free servers can connect up to **{FREE_GCAL_LIMIT} calendars** "
                             f"({count}/{FREE_GCAL_LIMIT} used).\n\n"
-                            "Upgrade to **[Soren Premium](https://soren.retrac.ca)** for unlimited integrations."
+                            "Upgrade to **[Soren Premium](https://soren.retrac.ca)** for up to "
+                            f"{PREMIUM_GCAL_LIMIT} integrations."
+                        ),
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+        else:
+            with get_connection() as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM gcal_integrations WHERE guild_id=?",
+                    (guild_id,),
+                ).fetchone()["cnt"]
+            if count >= PREMIUM_GCAL_LIMIT:
+                await ctx.respond(
+                    embed=discord.Embed(
+                        title="❌  Calendar Limit Reached",
+                        description=(
+                            f"Premium servers can connect up to **{PREMIUM_GCAL_LIMIT} calendars** "
+                            f"({count}/{PREMIUM_GCAL_LIMIT} used).\n\n"
+                            "Please remove an existing integration to add a new one."
                         ),
                         color=discord.Color.red(),
                     ),
