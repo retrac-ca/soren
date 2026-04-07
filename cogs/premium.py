@@ -93,8 +93,7 @@ class Premium(commands.Cog):
                 "• All 8 embed colors\n"
                 "• Up to **20** G-Cal integrations\n"
                 "• Mention/remind up to **3 roles** per event\n"
-                "• Custom RSVP button labels\n"
-                "• Recurring event auto-spawning\n\n"
+                "• Custom RSVP button labels\n\n"
                 "Run `/config` to confirm your server's plan."
             ),
             color=discord.Color.gold(),
@@ -125,7 +124,6 @@ class Premium(commands.Cog):
                 "\U0001f465 RSVP names shown\n"
                 "\U0001f3a8 Embed color options\n"
                 "\U0001f501 Recurring events\n"
-                "\U0001f504 Recurring auto-spawn\n"
                 "\U0001f4c6 Google Calendar sync\n"
                 "\U0001f4c6 G-Cal integrations\n"
                 "\U0001f514 Mention/remind roles\n"
@@ -140,7 +138,6 @@ class Premium(commands.Cog):
                 "50\n"
                 "3 colors\n"
                 "\u2705\n"
-                "\u274c\n"
                 "\u2705\n"
                 "Up to 5\n"
                 "1 role\n"
@@ -154,7 +151,6 @@ class Premium(commands.Cog):
                 f"{PREMIUM_EVENT_LIMIT}\n"
                 "100\n"
                 "8 colors\n"
-                "\u2705\n"
                 "\u2705\n"
                 "\u2705\n"
                 "Up to 20\n"

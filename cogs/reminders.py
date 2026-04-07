@@ -25,7 +25,7 @@ import pytz
 import json
 import logging
 
-from utils.database import get_connection, is_premium
+from utils.database import get_connection
 from utils.embeds import build_reminder_embed
 from cogs.events import compute_next_start, repost_recurring_embed
 
@@ -114,15 +114,8 @@ class Reminders(commands.Cog):
             log.info(f"Sending reminder for event {event_id}: {event['title']}")
             await self._send_reminder(event)
 
-            # ── Recurring auto-spawn (Premium only) ───────────────────────
+            # ── Recurring auto-spawn (all tiers) ─────────────────────────
             if event.get("is_recurring") and event.get("recur_rule"):
-                if not is_premium(event["guild_id"]):
-                    log.info(
-                        f"Skipping auto-spawn for recurring event {event_id} "
-                        f"(guild {event['guild_id']} is not Premium)"
-                    )
-                    continue
-
                 next_start = compute_next_start(
                     event["start_time"], event["recur_rule"], event.get("recur_interval", 1)
                 )
