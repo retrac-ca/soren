@@ -89,7 +89,7 @@ class Premium(commands.Cog):
                 f"**{ctx.guild.name}** now has access to Soren Premium!\n\n"
                 "**Unlocked:**\n"
                 f"• Up to **{PREMIUM_EVENT_LIMIT}** active events\n"
-                "• Unlimited RSVP list display\n"
+                "• Up to **100** RSVP names displayed\n"
                 "• All 8 embed colors\n"
                 "• Up to **20** G-Cal integrations\n"
                 "• Mention/remind up to **3 roles** per event\n"
@@ -152,7 +152,7 @@ class Premium(commands.Cog):
             name="\u2b50 Premium",
             value=(
                 f"{PREMIUM_EVENT_LIMIT}\n"
-                "Unlimited\n"
+                "100\n"
                 "8 colors\n"
                 "\u2705\n"
                 "\u2705\n"
