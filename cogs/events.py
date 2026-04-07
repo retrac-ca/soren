@@ -273,25 +273,35 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
 class NewEventModal(discord.ui.Modal):
     """
     Final step of /newevent.
-    notify_role_id and reminder_offset are passed in from earlier steps.
-    5th slot is only used for custom recurrence interval.
+    reminder_offset is passed in from earlier steps.
+    wants_role=True  → slot 5 = role name field (resolved in callback).
+    wants_role=False → slot 5 = custom interval field (only if recur_rule=="custom").
+    If both wants_role and custom recur are needed, role takes slot 5 and
+    recur_interval falls back to 7 days (editable via /editeventtime).
     """
 
     def __init__(self, channel: discord.TextChannel, recur_rule: str,
                  tz_name: str, reminder_offset: int,
-                 notify_role_id: int | None = None, *args, **kwargs):
+                 wants_role: bool = False, *args, **kwargs):
         super().__init__(title="Create a New Event", *args, **kwargs)
         self.target_channel  = channel
         self.recur_rule      = recur_rule
         self.tz_name         = tz_name
         self.reminder_offset = reminder_offset
-        self.notify_role_id  = notify_role_id
+        self.wants_role      = wants_role
 
         self.add_item(discord.ui.InputText(label="Event Title", placeholder="e.g. Weekly Raid Night", max_length=100))
         self.add_item(discord.ui.InputText(label="Description (optional)", placeholder="What's happening? Any details...", style=discord.InputTextStyle.paragraph, required=False, max_length=500))
         self.add_item(discord.ui.InputText(label="Start Date & Time", placeholder="2026-07-04 20:00  or  July 4 8pm  or  next Friday 9pm", max_length=50))
         self.add_item(discord.ui.InputText(label="End Date & Time (optional)", placeholder="2026-07-04 21:00  or  July 4 9pm", required=False, max_length=50))
-        if recur_rule == "custom":
+        # Slot 5: role field takes priority; custom interval is fallback if no role wanted
+        if wants_role:
+            self.add_item(discord.ui.InputText(
+                label="Mention & Reminder Role",
+                placeholder="Role name, @Role, or role ID  (e.g. Members)",
+                max_length=100,
+            ))
+        elif recur_rule == "custom":
             self.add_item(discord.ui.InputText(label="Repeat Interval (days)", placeholder="e.g. 14 for every 2 weeks", max_length=4))
 
     async def callback(self, interaction: discord.Interaction):
@@ -327,12 +337,40 @@ class NewEventModal(discord.ui.Modal):
 
         recur_interval  = 7
         reminder_offset = self.reminder_offset
+        notify_role_id  = None
 
-        if self.recur_rule == "custom" and len(self.children) > 4:
+        # Slot 5: resolve role OR custom interval depending on what was shown
+        if self.wants_role and len(self.children) > 4:
+            role_raw = self.children[4].value.strip() if self.children[4].value else ""
+            if role_raw:
+                try:
+                    role = interaction.guild.get_role(int(role_raw))
+                    if role:
+                        notify_role_id = role.id
+                except ValueError:
+                    clean = role_raw.lstrip("@").strip()
+                    role  = discord.utils.find(
+                        lambda r: r.name.lower() == clean.lower(),
+                        interaction.guild.roles,
+                    )
+                    if role:
+                        notify_role_id = role.id
+                if not notify_role_id:
+                    log.warning(
+                        f"NewEventModal: could not resolve role '{role_raw}' "
+                        f"in guild {interaction.guild.id} — creating event without role"
+                    )
+        elif not self.wants_role and self.recur_rule == "custom" and len(self.children) > 4:
             try:
                 recur_interval = max(1, int(self.children[4].value.strip()))
             except ValueError:
                 recur_interval = 7
+
+        # If wants_role + custom recur at the same time, role took slot 5 so
+        # recur_interval stays at default 7 — user can adjust via /editeventtime
+        custom_interval_note = ""
+        if self.wants_role and self.recur_rule == "custom":
+            custom_interval_note = "\n📝 Custom repeat interval defaulted to **7 days** — use `/editeventtime` to adjust."
 
         start_dt = _parse_datetime(start_raw, self.tz_name)
         if not start_dt:
@@ -367,7 +405,7 @@ class NewEventModal(discord.ui.Modal):
                 (guild_id, self.target_channel.id, interaction.user.id,
                  title, description, self.tz_name, start_iso, end_iso,
                  is_recurring, self.recur_rule, recur_interval,
-                 reminder_offset, self.notify_role_id),
+                 reminder_offset, notify_role_id),
             )
             event_id = cursor.lastrowid
             conn.commit()
@@ -377,7 +415,7 @@ class NewEventModal(discord.ui.Modal):
             "timezone": self.tz_name, "start_time": start_iso, "end_time": end_iso,
             "is_recurring": is_recurring, "recur_rule": self.recur_rule,
             "recur_interval": recur_interval, "channel_id": self.target_channel.id,
-            "reminder_offset": reminder_offset, "notify_role_id": self.notify_role_id,
+            "reminder_offset": reminder_offset, "notify_role_id": notify_role_id,
             "btn_accept_label": "✅ Accept", "btn_decline_label": "❌ Decline",
             "btn_tentative_label": "❓ Tentative", "btn_tentative_enabled": 1,
         }
@@ -393,65 +431,9 @@ class NewEventModal(discord.ui.Modal):
         await interaction.followup.send(
             embed=build_success_embed(
                 f"**{title}** created in {self.target_channel.mention}! "
-                f"(ID: `{event_id}` · {recur_str}){tz_warning}"
+                f"(ID: `{event_id}` · {recur_str}){tz_warning}{custom_interval_note}"
             ),
             ephemeral=True,
-        )
-
-
-# ── Step 3b — Role input modal (Yes path only) ────────────────────────────────
-
-class RoleInputModal(discord.ui.Modal):
-    """
-    Single-field modal shown when the user picks Yes on the role ping step.
-    Resolves the role, then opens NewEventModal.
-    """
-
-    def __init__(self, channel: discord.TextChannel, recur_rule: str,
-                 tz_name: str, *args, **kwargs):
-        super().__init__(title="Set Mention & Reminder Role", *args, **kwargs)
-        self.channel    = channel
-        self.recur_rule = recur_rule
-        self.tz_name    = tz_name
-
-        self.add_item(discord.ui.InputText(
-            label="Role name, @Role, or role ID",
-            placeholder="e.g.  Members  or  @Events  or  123456789",
-            max_length=100,
-        ))
-
-    async def callback(self, interaction: discord.Interaction):
-        role_raw       = self.children[0].value.strip()
-        notify_role_id = None
-
-        if role_raw:
-            try:
-                role = interaction.guild.get_role(int(role_raw))
-                if role:
-                    notify_role_id = role.id
-            except ValueError:
-                clean = role_raw.lstrip("@").strip()
-                role  = discord.utils.find(
-                    lambda r: r.name.lower() == clean.lower(),
-                    interaction.guild.roles,
-                )
-                if role:
-                    notify_role_id = role.id
-
-        if not notify_role_id:
-            log.warning(
-                f"RoleInputModal: could not resolve role '{role_raw}' "
-                f"in guild {interaction.guild.id} — proceeding without role"
-            )
-
-        await interaction.response.send_modal(
-            NewEventModal(
-                channel=self.channel,
-                recur_rule=self.recur_rule,
-                tz_name=self.tz_name,
-                reminder_offset=DEFAULT_REMINDER_OFFSET,
-                notify_role_id=notify_role_id,
-            )
         )
 
 
@@ -460,8 +442,10 @@ class RoleInputModal(discord.ui.Modal):
 class RolePingSelectView(discord.ui.View):
     """
     Step 3 of /newevent.
-    Yes → RoleInputModal (single field) → NewEventModal.
-    No  → NewEventModal directly, no role, reminder silently defaults to 15 min.
+    Yes → NewEventModal with wants_role=True (role field appears as slot 5).
+    No  → NewEventModal with wants_role=False, no role, reminder defaults to 15 min.
+    Opening a second modal from a modal callback is blocked by Discord (error 50035),
+    so the role field is folded directly into NewEventModal instead.
     """
 
     def __init__(self, channel: discord.TextChannel, author_id: int,
@@ -481,26 +465,17 @@ class RolePingSelectView(discord.ui.View):
             return
 
         self.stop()
+        wants_role = select.values[0] == "yes"
 
-        if select.values[0] == "yes":
-            await interaction.response.send_modal(
-                RoleInputModal(
-                    channel=self.channel,
-                    recur_rule=self.recur_rule,
-                    tz_name=self.tz_name,
-                )
+        await interaction.response.send_modal(
+            NewEventModal(
+                channel=self.channel,
+                recur_rule=self.recur_rule,
+                tz_name=self.tz_name,
+                reminder_offset=DEFAULT_REMINDER_OFFSET,
+                wants_role=wants_role,
             )
-        else:
-            # No role — skip reminder, go straight to detail modal
-            await interaction.response.send_modal(
-                NewEventModal(
-                    channel=self.channel,
-                    recur_rule=self.recur_rule,
-                    tz_name=self.tz_name,
-                    reminder_offset=DEFAULT_REMINDER_OFFSET,
-                    notify_role_id=None,
-                )
-            )
+        )
 
 
 # ── Step 2 — Timezone selector ────────────────────────────────────────────────
