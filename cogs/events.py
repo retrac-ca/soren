@@ -67,8 +67,9 @@ try:
 except ImportError:
     HAS_DATEUTIL = False
 
-# ── Free tier limit ───────────────────────────────────────────────────────────
-FREE_EVENT_LIMIT = 10
+# ── Tier event limits ─────────────────────────────────────────────────────────
+FREE_EVENT_LIMIT    = 10   # Max active (upcoming) events for free servers
+PREMIUM_EVENT_LIMIT = 50   # Max active (upcoming) events for premium servers
 
 # ── RSVP cooldown tracking (in-memory, per user per event) ───────────────────
 # key: (user_id, event_id) → timestamp of last interaction
@@ -164,9 +165,16 @@ def build_listevents_embed(rows, guild):
 
 
 def get_guild_event_count(guild_id: int) -> int:
+    """
+    Count only upcoming (active) events for this guild.
+    Past events do not count against the limit — a server that has run
+    50 events historically should not be blocked from creating new ones.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM events WHERE guild_id = ?", (guild_id,)
+            "SELECT COUNT(*) as cnt FROM events WHERE guild_id = ? AND start_time >= ?",
+            (guild_id, now_iso),
         ).fetchone()
     return row["cnt"] if row else 0
 
@@ -195,14 +203,26 @@ def compute_next_start(start_iso: str, recur_rule: str, recur_interval: int) -> 
 
 
 async def post_event_embed(channel: discord.TextChannel, event_data: dict):
-    """Build and post the event embed. Saves message_id back to DB."""
+    """
+    Build and post the event embed. Saves message_id back to DB.
+    If a notify_role_id is set, pings that role alongside the embed
+    so the server knows a new event has been created.
+    """
     from cogs.rsvp import EventView
     cfg = get_guild_config(channel.guild.id)
     event_data = {**event_data, "embed_color": cfg.get("embed_color") if cfg else None}
     rsvps = {"accepted": [], "declined": [], "tentative": []}
     embed = build_event_embed(event_data, rsvps)
     view  = EventView(event_id=event_data["id"], event=event_data)
-    msg   = await channel.send(embed=embed, view=view)
+
+    # ── Creation ping: mention the notify role when the event is first posted ──
+    ping_content = None
+    if event_data.get("notify_role_id"):
+        role = channel.guild.get_role(event_data["notify_role_id"])
+        if role:
+            ping_content = role.mention
+
+    msg = await channel.send(content=ping_content, embed=embed, view=view)
     with get_connection() as conn:
         conn.execute("UPDATE events SET message_id = ? WHERE id = ?", (msg.id, event_data["id"]))
         conn.commit()
@@ -212,6 +232,7 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
     """
     Called after a recurring event advances to its next occurrence.
     Deletes the old embed and posts a fresh one with the updated time.
+    The notify_role is NOT pinged on auto-respawn — only on manual creation.
     """
     from cogs.rsvp import EventView
     with get_connection() as conn:
@@ -235,7 +256,7 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
         except (discord.NotFound, discord.Forbidden):
             pass
 
-    # Post a fresh embed
+    # Post a fresh embed — no ping on auto-respawn
     cfg = get_guild_config(guild.id)
     event = {**event, "embed_color": cfg.get("embed_color") if cfg else None}
     rsvps = {"accepted": [], "declined": [], "tentative": []}
@@ -279,10 +300,26 @@ class NewEventModal(discord.ui.Modal):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild_id = interaction.guild.id
+        premium  = is_premium(guild_id)
 
-        if not is_premium(guild_id) and get_guild_event_count(guild_id) >= FREE_EVENT_LIMIT:
+        # ── Tier-aware active event cap ───────────────────────────────────
+        active_count = get_guild_event_count(guild_id)
+        if premium and active_count >= PREMIUM_EVENT_LIMIT:
             await interaction.followup.send(
-                embed=build_error_embed(f"Free servers are limited to **{FREE_EVENT_LIMIT} events**. Delete an old event or upgrade to Premium."),
+                embed=build_error_embed(
+                    f"Premium servers are limited to **{PREMIUM_EVENT_LIMIT} active events**. "
+                    f"You currently have **{active_count}** — delete or wait for some to pass."
+                ),
+                ephemeral=True,
+            )
+            return
+        elif not premium and active_count >= FREE_EVENT_LIMIT:
+            await interaction.followup.send(
+                embed=build_error_embed(
+                    f"Free servers are limited to **{FREE_EVENT_LIMIT} active events** "
+                    f"({active_count}/{FREE_EVENT_LIMIT} used). "
+                    f"Delete an old event or upgrade to ⭐ Premium for up to {PREMIUM_EVENT_LIMIT}."
+                ),
                 ephemeral=True,
             )
             return
@@ -580,8 +617,6 @@ class EditEventTimeModal(discord.ui.Modal):
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
 
-        # Defer immediately — dateparser can exceed Discord's 3s timeout,
-        # and deferring also lets us send proper error embeds via followup
         await interaction.response.defer(ephemeral=True)
 
         start_raw    = self.children[0].value.strip()
@@ -958,7 +993,6 @@ class Events(commands.Cog):
     # ── /listevents ───────────────────────────────────────────────────────
     @discord.slash_command(name="listevents", description="List all upcoming events in this server.")
     async def listevents(self, ctx: discord.ApplicationContext):
-        # Use start of today (UTC midnight) so events happening later today are included
         now = datetime.now(timezone.utc)
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         start_iso = start_of_day.isoformat()
@@ -1014,7 +1048,6 @@ class Events(commands.Cog):
 
         event = dict(row)
 
-        # Guard against cancelling an already-cancelled event
         if event["title"].startswith("[CANCELLED]"):
             await ctx.respond(
                 embed=build_error_embed("This event has already been cancelled."),

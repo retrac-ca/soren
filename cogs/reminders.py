@@ -12,8 +12,10 @@ Reminders go out `reminder_offset` minutes before the event starts
 Reminders are tracked in the DB (reminded_at column) so they survive
 bot restarts and are never sent twice.
 
-After a recurring event fires its reminder, the start_time is advanced
-to the next occurrence and a fresh embed is posted in the channel.
+After a recurring event fires its reminder, the start_time (and end_time
+if set) is advanced to the next occurrence and a fresh embed is posted.
+Auto-spawning is a Premium-only feature — free servers still receive
+reminders but their recurring events do not auto-advance.
 """
 
 import discord
@@ -23,7 +25,7 @@ import pytz
 import json
 import logging
 
-from utils.database import get_connection
+from utils.database import get_connection, is_premium
 from utils.embeds import build_reminder_embed
 from cogs.events import compute_next_start, repost_recurring_embed
 
@@ -112,19 +114,41 @@ class Reminders(commands.Cog):
             log.info(f"Sending reminder for event {event_id}: {event['title']}")
             await self._send_reminder(event)
 
-            # Advance recurring events and repost embed
+            # ── Recurring auto-spawn (Premium only) ───────────────────────
             if event.get("is_recurring") and event.get("recur_rule"):
+                if not is_premium(event["guild_id"]):
+                    log.info(
+                        f"Skipping auto-spawn for recurring event {event_id} "
+                        f"(guild {event['guild_id']} is not Premium)"
+                    )
+                    continue
+
                 next_start = compute_next_start(
                     event["start_time"], event["recur_rule"], event.get("recur_interval", 1)
                 )
                 if next_start:
+                    # Also advance end_time by the same delta if one is set
+                    next_end = None
+                    if event.get("end_time"):
+                        try:
+                            start_dt_naive = datetime.fromisoformat(event["start_time"])
+                            end_dt_naive   = datetime.fromisoformat(event["end_time"])
+                            duration       = end_dt_naive - start_dt_naive
+                            next_end       = (datetime.fromisoformat(next_start) + duration).isoformat()
+                        except Exception:
+                            next_end = None
+
                     with get_connection() as conn:
                         conn.execute(
-                            "UPDATE events SET start_time=?, reminded_at=NULL WHERE id=?",
-                            (next_start, event_id),
+                            "UPDATE events SET start_time=?, end_time=?, reminded_at=NULL WHERE id=?",
+                            (next_start, next_end, event_id),
                         )
                         conn.commit()
-                    log.info(f"Advanced recurring event {event_id} to next occurrence: {next_start}")
+
+                    log.info(
+                        f"Auto-spawned next occurrence of recurring event {event_id} "
+                        f"→ {next_start} (guild {event['guild_id']})"
+                    )
                     await repost_recurring_embed(self.bot, event_id)
                 else:
                     log.info(f"No more occurrences for recurring event {event_id}")
