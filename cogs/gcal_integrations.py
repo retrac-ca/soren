@@ -50,7 +50,7 @@ CREDS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 
 EVENTS_PER_PAGE    = 8
 FREE_GCAL_LIMIT    = 2
-PREMIUM_GCAL_LIMIT = 20
+PREMIUM_GCAL_LIMIT = 10
 
 # Pending OAuth flows keyed by guild_id
 _pending_flows: dict[int, object] = {}

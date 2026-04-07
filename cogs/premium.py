@@ -153,7 +153,7 @@ class Premium(commands.Cog):
                 "10 colors\n"
                 "\u2705\n"
                 "\u2705\n"
-                "Up to 20\n"
+                "Up to 10\n"
                 "Up to 3 roles\n"
                 "\u2705"
             ),
