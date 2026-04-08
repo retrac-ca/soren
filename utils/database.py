@@ -67,6 +67,7 @@ def init_db():
             parent_event_id       INTEGER,
             reminder_offset       INTEGER DEFAULT 15,
             notify_role_id        INTEGER,
+            notify_role_ids       TEXT,
             gcal_event_id         TEXT,
             reminded_at           TEXT,
             embed_color           TEXT    DEFAULT '5865F2',
@@ -89,6 +90,9 @@ def init_db():
         ("reminded_at",           "TEXT"),
         ("embed_color",           "TEXT DEFAULT '5865F2'"),
         ("max_rsvp",              "INTEGER DEFAULT 0"),
+        # Multi-role support — stores JSON array of role IDs e.g. "[123, 456, 789]"
+        # notify_role_id (singular) is kept for backward compatibility
+        ("notify_role_ids",       "TEXT"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")

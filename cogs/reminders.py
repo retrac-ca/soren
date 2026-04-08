@@ -160,12 +160,15 @@ class Reminders(commands.Cog):
         embed      = build_reminder_embed(event)
         ping_parts = []
 
-        if event.get("notify_role_id"):
-            role = channel.guild.get_role(event["notify_role_id"])
+        # ── Ping all notify roles (multi-role support) ────────────────────
+        from cogs.events import _parse_role_ids
+        role_ids = _parse_role_ids(event)
+        for rid in role_ids:
+            role = channel.guild.get_role(rid)
             if role:
                 ping_parts.append(role.mention)
             else:
-                log.warning(f"Reminder: role {event['notify_role_id']} not found in guild")
+                log.warning(f"Reminder: role {rid} not found in guild for event {event['id']}")
 
         with get_connection() as conn:
             rows = conn.execute(

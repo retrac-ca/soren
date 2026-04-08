@@ -38,6 +38,7 @@ from discord.ext import commands
 from datetime import datetime, timedelta, timezone
 import pytz
 import io
+import json
 
 from utils.database import get_connection, is_premium, get_guild_config
 from utils.permissions import is_event_creator, check_setup
@@ -196,8 +197,34 @@ def compute_next_start(start_iso: str, recur_rule: str, recur_interval: int) -> 
     return next_dt.isoformat()
 
 
+def _parse_role_ids(event: dict) -> list[int]:
+    """
+    Return the list of notify role IDs for an event.
+    Reads from notify_role_ids (JSON array, new) first.
+    Falls back to notify_role_id (single int, legacy) if notify_role_ids is absent.
+    Always returns a plain list of ints (may be empty).
+    """
+    raw = event.get("notify_role_ids")
+    if raw:
+        try:
+            ids = json.loads(raw)
+            if isinstance(ids, list):
+                return [int(i) for i in ids if i]
+        except Exception:
+            pass
+    # Legacy fallback
+    legacy = event.get("notify_role_id")
+    if legacy:
+        return [int(legacy)]
+    return []
+
+
 async def post_event_embed(channel: discord.TextChannel, event_data: dict):
-    """Build and post the event embed. Pings notify_role on creation if set."""
+    """
+    Build and post the event embed.
+    Pings all roles in notify_role_ids on creation if set.
+    Falls back to legacy notify_role_id for backward compatibility.
+    """
     from cogs.rsvp import EventView
     cfg = get_guild_config(channel.guild.id)
     event_data = {**event_data, "embed_color": cfg.get("embed_color") if cfg else None}
@@ -205,11 +232,14 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict):
     embed = build_event_embed(event_data, rsvps)
     view  = EventView(event_id=event_data["id"], event=event_data)
 
-    ping_content = None
-    if event_data.get("notify_role_id"):
-        role = channel.guild.get_role(event_data["notify_role_id"])
+    # Build ping string from notify_role_ids (new) or notify_role_id (legacy)
+    ping_parts = []
+    role_ids = _parse_role_ids(event_data)
+    for rid in role_ids:
+        role = channel.guild.get_role(rid)
         if role:
-            ping_content = role.mention
+            ping_parts.append(role.mention)
+    ping_content = " ".join(ping_parts) if ping_parts else None
 
     msg = await channel.send(content=ping_content, embed=embed, view=view)
     with get_connection() as conn:
@@ -262,27 +292,43 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
 # ── Edit Event Details Modal ──────────────────────────────────────────────────
 
 class EditEventDetailsModal(discord.ui.Modal):
-    """Edit title, description, max RSVPs, and notify role. Opened by /editeventdetails."""
+    """
+    Edit title, description, max RSVPs, and notify role(s).
+    Opened by /editeventdetails.
+    Free:    1 role max. Premium: up to 3 roles (comma-separated in one field).
+    Fields: Title · Description · Max RSVPs · Mention & Reminder Role(s)  (4 of 5 slots)
+    """
 
     def __init__(self, event: dict, guild: discord.Guild, *args, **kwargs):
         super().__init__(title="Edit Event Details", *args, **kwargs)
-        self.event = event
+        self.event   = event
+        self.guild   = guild
+        self.premium = is_premium(guild.id)
 
-        notify_role_value = ""
-        if event.get("notify_role_id"):
-            role = guild.get_role(event["notify_role_id"])
-            if role:
-                notify_role_value = role.name
+        # Build pre-fill value from existing roles
+        existing_role_ids = _parse_role_ids(event)
+        role_names = []
+        for rid in existing_role_ids:
+            r = guild.get_role(rid)
+            if r:
+                role_names.append(r.name)
+        role_prefill = ", ".join(role_names)
+
+        placeholder = (
+            "Up to 3 roles — e.g.  Members, Officers, Raid Team  (leave blank to clear)"
+            if self.premium else
+            "Role name, @Role, or role ID — leave blank to clear"
+        )
 
         self.add_item(discord.ui.InputText(label="Event Title", value=event["title"], max_length=100))
         self.add_item(discord.ui.InputText(label="Description (optional)", value=event.get("description") or "", style=discord.InputTextStyle.paragraph, required=False, max_length=500))
         self.add_item(discord.ui.InputText(label="Max RSVPs (0 = unlimited)", value=str(event.get("max_rsvp") or 0), max_length=6))
         self.add_item(discord.ui.InputText(
-            label="Mention & Reminder Role (optional)",
-            value=notify_role_value,
-            placeholder="Role name, @Role, or role ID — leave blank to clear",
+            label="Mention & Reminder Role(s) (optional)",
+            value=role_prefill,
+            placeholder=placeholder,
             required=False,
-            max_length=100,
+            max_length=200,
         ))
 
     async def callback(self, interaction: discord.Interaction):
@@ -292,31 +338,39 @@ class EditEventDetailsModal(discord.ui.Modal):
         title        = self.children[0].value.strip()
         description  = self.children[1].value.strip()
         max_rsvp_raw = self.children[2].value.strip()
-        role_raw     = self.children[3].value.strip()
+        roles_raw    = self.children[3].value.strip()
 
         try:
             max_rsvp = max(0, int(max_rsvp_raw))
         except ValueError:
             max_rsvp = 0
 
-        if role_raw:
-            notify_role_id = None
-            try:
-                role = interaction.guild.get_role(int(role_raw))
-                if role:
-                    notify_role_id = role.id
-            except ValueError:
-                clean = role_raw.lstrip("@").strip()
-                role  = discord.utils.find(lambda r: r.name.lower() == clean.lower(), interaction.guild.roles)
-                if role:
-                    notify_role_id = role.id
-        else:
-            notify_role_id = None
+        # Resolve roles — blank clears all
+        role_ids = []
+        if roles_raw:
+            max_roles = 3 if self.premium else 1
+            parts = [p.strip() for p in roles_raw.split(",") if p.strip()]
+            for part in parts[:max_roles]:
+                resolved = None
+                try:
+                    r = interaction.guild.get_role(int(part))
+                    if r:
+                        resolved = r.id
+                except ValueError:
+                    clean = part.lstrip("@").strip()
+                    r = discord.utils.find(lambda r: r.name.lower() == clean.lower(), interaction.guild.roles)
+                    if r:
+                        resolved = r.id
+                if resolved:
+                    role_ids.append(resolved)
+
+        notify_role_id  = role_ids[0] if role_ids else None
+        notify_role_ids = json.dumps(role_ids) if role_ids else None
 
         with get_connection() as conn:
             conn.execute(
-                "UPDATE events SET title=?, description=?, max_rsvp=?, notify_role_id=? WHERE id=?",
-                (title, description, max_rsvp, notify_role_id, self.event["id"]),
+                "UPDATE events SET title=?, description=?, max_rsvp=?, notify_role_id=?, notify_role_ids=? WHERE id=?",
+                (title, description, max_rsvp, notify_role_id, notify_role_ids, self.event["id"]),
             )
             conn.commit()
 
@@ -583,6 +637,8 @@ class Events(commands.Cog):
         timezone: discord.Option(str, description="Timezone (default: UTC). Start typing to search.", required=False, default="UTC", autocomplete=autocomplete_timezone),
         recurrence: discord.Option(str, description="How often the event repeats (default: no repeat).", required=False, default="none", autocomplete=autocomplete_recurrence),
         role: discord.Option(discord.Role, description="Role to ping on creation and at reminder time (optional).", required=False, default=None),
+        role2: discord.Option(discord.Role, description="Second role to ping — ⭐ Premium only.", required=False, default=None),
+        role3: discord.Option(discord.Role, description="Third role to ping — ⭐ Premium only.", required=False, default=None),
         reminder: discord.Option(int, description="Minutes before start to send reminder (default: 15).", required=False, default=15),
         max_rsvp: discord.Option(int, description="Max accepted RSVPs — 0 for unlimited (default: 0).", required=False, default=0),
         recur_interval: discord.Option(int, description="Days between occurrences — only used if recurrence is 'custom'.", required=False, default=7),
@@ -666,11 +722,30 @@ class Events(commands.Cog):
             end_iso = end_dt.isoformat()
 
         is_recurring    = 0 if recur_rule == "none" else 1
-        notify_role_id  = role.id if role else None
         reminder_offset = max(1, reminder) if reminder else DEFAULT_REMINDER_OFFSET
         recur_int       = max(1, recur_interval) if recur_interval else 7
         desc_clean      = (description or "").strip()
         max_rsvp_clean  = max(0, max_rsvp) if max_rsvp else 0
+
+        # ── Build role list ───────────────────────────────────────────────
+        # Free: max 1 role. Premium: up to 3 roles.
+        # Extra roles (role2, role3) are silently ignored for free servers.
+        role_ids = []
+        if role:
+            role_ids.append(role.id)
+        if premium:
+            if role2:
+                role_ids.append(role2.id)
+            if role3:
+                role_ids.append(role3.id)
+        elif (role2 or role3):
+            log.info(
+                f"role2/role3 supplied by non-premium guild {guild_id} — ignoring extra roles"
+            )
+
+        # Keep legacy notify_role_id in sync with the first role for backward compat
+        notify_role_id  = role_ids[0] if role_ids else None
+        notify_role_ids = json.dumps(role_ids) if role_ids else None
 
         tz_warning = "\n⚠️ No timezone specified — event created in **UTC**. Use `/editeventtime` to change if needed." if tz_name == "UTC" and not timezone else ""
 
@@ -682,13 +757,13 @@ class Events(commands.Cog):
                     (guild_id, channel_id, creator_id, title, description,
                      timezone, start_time, end_time, is_recurring,
                      recur_rule, recur_interval, reminder_offset,
-                     notify_role_id, max_rsvp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     notify_role_id, notify_role_ids, max_rsvp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (guild_id, channel.id, ctx.author.id,
                  title, desc_clean, tz_name, start_iso, end_iso,
                  is_recurring, recur_rule, recur_int,
-                 reminder_offset, notify_role_id, max_rsvp_clean),
+                 reminder_offset, notify_role_id, notify_role_ids, max_rsvp_clean),
             )
             event_id = cursor.lastrowid
             conn.commit()
@@ -698,7 +773,9 @@ class Events(commands.Cog):
             "timezone": tz_name, "start_time": start_iso, "end_time": end_iso,
             "is_recurring": is_recurring, "recur_rule": recur_rule,
             "recur_interval": recur_int, "channel_id": channel.id,
-            "reminder_offset": reminder_offset, "notify_role_id": notify_role_id,
+            "reminder_offset": reminder_offset,
+            "notify_role_id": notify_role_id,
+            "notify_role_ids": notify_role_ids,
             "max_rsvp": max_rsvp_clean,
             "btn_accept_label": "✅ Accept", "btn_decline_label": "❌ Decline",
             "btn_tentative_label": "❓ Tentative", "btn_tentative_enabled": 1,
@@ -710,7 +787,8 @@ class Events(commands.Cog):
         if recur_rule == "custom":
             recur_str = f"Every {recur_int} days"
 
-        role_str = f" · pinging {role.mention}" if role else ""
+        roles_mentioned = [r for r in [role, role2 if premium else None, role3 if premium else None] if r]
+        role_str = f" · pinging {', '.join(r.mention for r in roles_mentioned)}" if roles_mentioned else ""
         log.info(f"Event created: '{title}' (ID {event_id}) in guild {guild_id} by {ctx.author}")
 
         await ctx.followup.send(
