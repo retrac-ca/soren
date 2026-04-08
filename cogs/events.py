@@ -5,7 +5,7 @@ Slash commands for creating, editing, and deleting events.
 
 Commands
 --------
-/newevent          — 4-step event creation flow
+/newevent          — Create an event via inline slash command options (no modal flow)
 /editeventdetails  — Edit title, description, max RSVPs, notify role
 /editeventtime     — Edit start/end time, timezone, reminder offset
 /deleteevent       — Delete an event (with confirmation)
@@ -15,17 +15,22 @@ Commands
 /myevents          — List events the caller has RSVPed to
 /exportevents      — Export upcoming events as a .ics calendar file
 
-Event creation flow
--------------------
-Step 1 — What type of event?        (RecurrenceSelectView)
-Step 2 — What timezone?             (TimezoneSelectView)
-Step 3 — Mention/remind a role?     (RolePingSelectView)
-  └─ Yes → single-field modal       (RoleInputModal) → Step 4
-  └─ No  → skip reminder entirely   → Step 4
-Step 4 — Fill in event details      (NewEventModal)
-  Fields: Title · Description · Start · End · custom interval (conditional)
-  Notify Role field removed — handled in Step 3.
-  If no role was set, reminder_offset defaults to 15 min silently.
+/newevent parameters
+--------------------
+Required:
+  channel     — Text channel to post the event in
+  title       — Event title
+  start       — Start date/time (flexible format)
+
+Optional:
+  description — Event description
+  end         — End date/time
+  timezone    — tz name with autocomplete (default: UTC)
+  recurrence  — none/daily/weekly/biweekly/bimonthly/monthly/custom (default: none)
+  role        — Discord role to ping on creation and at reminder time
+  reminder    — Minutes before start to send reminder (default: 15)
+  max_rsvp    — Maximum accepted RSVPs (default: 0 = unlimited)
+  recur_interval — Days between occurrences if recurrence=custom
 """
 
 import discord
@@ -78,37 +83,7 @@ FREE_EVENT_LIMIT    = 10
 PREMIUM_EVENT_LIMIT = 50
 
 # ── Default reminder offset ───────────────────────────────────────────────────
-DEFAULT_REMINDER_OFFSET = 15  # minutes — used when no role is set
-
-# ── Timezone options ──────────────────────────────────────────────────────────
-TIMEZONES = [
-    discord.SelectOption(label="Eastern Time (ET)",           value="America/New_York",    emoji="🕐", description="UTC-5 / UTC-4 (DST)"),
-    discord.SelectOption(label="Central Time (CT)",           value="America/Chicago",     emoji="🕐", description="UTC-6 / UTC-5 (DST)"),
-    discord.SelectOption(label="Mountain Time (MT)",          value="America/Denver",      emoji="🕐", description="UTC-7 / UTC-6 (DST)"),
-    discord.SelectOption(label="Mountain Time - AZ (no DST)", value="America/Phoenix",     emoji="🕐", description="UTC-7, no daylight saving"),
-    discord.SelectOption(label="Pacific Time (PT)",           value="America/Los_Angeles", emoji="🕐", description="UTC-8 / UTC-7 (DST)"),
-    discord.SelectOption(label="Alaska Time (AKT)",           value="America/Anchorage",   emoji="🕐", description="UTC-9 / UTC-8 (DST)"),
-    discord.SelectOption(label="Hawaii Time (HT)",            value="Pacific/Honolulu",    emoji="🕐", description="UTC-10, no daylight saving"),
-    discord.SelectOption(label="Atlantic Time (AT)",          value="America/Halifax",     emoji="🕐", description="UTC-4 / UTC-3 (DST)"),
-    discord.SelectOption(label="Newfoundland Time (NT)",      value="America/St_Johns",    emoji="🕐", description="UTC-3:30 / UTC-2:30 (DST)"),
-    discord.SelectOption(label="London (GMT/BST)",            value="Europe/London",       emoji="🇬🇧", description="Europe/London"),
-    discord.SelectOption(label="Berlin (CET/CEST)",           value="Europe/Berlin",       emoji="🇩🇪", description="Europe/Berlin"),
-    discord.SelectOption(label="Sydney (AEDT/AEST)",          value="Australia/Sydney",    emoji="🇦🇺", description="Australia/Sydney"),
-    discord.SelectOption(label="Tokyo (JST)",                 value="Asia/Tokyo",          emoji="🇯🇵", description="Asia/Tokyo"),
-    discord.SelectOption(label="New Delhi (IST)",             value="Asia/Kolkata",        emoji="🇮🇳", description="Asia/Kolkata"),
-    discord.SelectOption(label="UTC",                         value="UTC",                 emoji="🌐", description="Coordinated Universal Time"),
-]
-
-# ── Recurrence options ────────────────────────────────────────────────────────
-RECUR_OPTIONS = [
-    discord.SelectOption(label="Single Event", value="none",      emoji="📅", description="One-time event, no repeat"),
-    discord.SelectOption(label="Daily",        value="daily",     emoji="🔁", description="Repeats every day"),
-    discord.SelectOption(label="Weekly",       value="weekly",    emoji="🔁", description="Repeats every week"),
-    discord.SelectOption(label="Bi-Weekly",    value="biweekly",  emoji="🔁", description="Repeats every 2 weeks"),
-    discord.SelectOption(label="Bi-Monthly",   value="bimonthly", emoji="🔁", description="Repeats every 2 months"),
-    discord.SelectOption(label="Monthly",      value="monthly",   emoji="🔁", description="Repeats every month"),
-    discord.SelectOption(label="Custom",       value="custom",    emoji="⚙️", description="Set a custom number of days between events"),
-]
+DEFAULT_REMINDER_OFFSET = 15  # minutes
 
 RECUR_LABELS = {
     "none":      "One-time",
@@ -120,24 +95,17 @@ RECUR_LABELS = {
     "custom":    "Custom",
 }
 
-# ── Role ping yes/no options ──────────────────────────────────────────────────
-ROLE_PING_OPTIONS = [
-    discord.SelectOption(
-        label="Yes — mention a role",
-        value="yes",
-        emoji="🔔",
-        description="Ping a role when the event posts and at reminder time",
-    ),
-    discord.SelectOption(
-        label="No — skip role mention",
-        value="no",
-        emoji="🔕",
-        description="No role ping — go straight to event details",
-    ),
+# ── Timezone autocomplete list ────────────────────────────────────────────────
+TIMEZONE_CHOICES = [
+    "America/New_York", "America/Chicago", "America/Denver", "America/Phoenix",
+    "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu", "America/Halifax",
+    "America/St_Johns", "Europe/London", "Europe/Berlin", "Europe/Paris",
+    "Europe/Moscow", "Asia/Dubai", "Asia/Kolkata", "Asia/Bangkok",
+    "Asia/Tokyo", "Asia/Shanghai", "Australia/Sydney", "Pacific/Auckland", "UTC",
 ]
 
 
-# ── Autocomplete helpers ──────────────────────────────────────────────────────
+# ── Autocomplete callbacks ────────────────────────────────────────────────────
 
 async def autocomplete_event_ids(ctx: discord.AutocompleteContext):
     now = datetime.now(timezone.utc)
@@ -148,6 +116,29 @@ async def autocomplete_event_ids(ctx: discord.AutocompleteContext):
             (ctx.interaction.guild.id, start_of_day)
         ).fetchall()
     return [discord.OptionChoice(name=f"{row['id']}: {row['title'][:80]}", value=row['id']) for row in rows]
+
+
+async def autocomplete_timezone(ctx: discord.AutocompleteContext):
+    val = ctx.value.lower()
+    matches = [tz for tz in TIMEZONE_CHOICES if val in tz.lower()]
+    # Also search all pytz timezones for more specific queries
+    if len(matches) < 10 and len(val) >= 3:
+        matches += [tz for tz in pytz.all_timezones if val in tz.lower() and tz not in matches]
+    return [discord.OptionChoice(name=tz, value=tz) for tz in matches[:25]]
+
+
+async def autocomplete_recurrence(ctx: discord.AutocompleteContext):
+    options = [
+        discord.OptionChoice(name="Single Event (no repeat)", value="none"),
+        discord.OptionChoice(name="Daily",                    value="daily"),
+        discord.OptionChoice(name="Weekly",                   value="weekly"),
+        discord.OptionChoice(name="Bi-Weekly",                value="biweekly"),
+        discord.OptionChoice(name="Bi-Monthly",               value="bimonthly"),
+        discord.OptionChoice(name="Monthly",                  value="monthly"),
+        discord.OptionChoice(name="Custom interval",          value="custom"),
+    ]
+    val = ctx.value.lower()
+    return [o for o in options if val in o.name.lower()] or options
 
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
@@ -268,290 +259,10 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
         log.warning(f"repost_recurring_embed: no permission in channel {channel.id}")
 
 
-# ── Step 4 — Event detail modal ───────────────────────────────────────────────
-
-class NewEventModal(discord.ui.Modal):
-    """
-    Final step of /newevent.
-    reminder_offset is passed in from earlier steps.
-    wants_role=True  → slot 5 = role name field (resolved in callback).
-    wants_role=False → slot 5 = custom interval field (only if recur_rule=="custom").
-    If both wants_role and custom recur are needed, role takes slot 5 and
-    recur_interval falls back to 7 days (editable via /editeventtime).
-    """
-
-    def __init__(self, channel: discord.TextChannel, recur_rule: str,
-                 tz_name: str, reminder_offset: int,
-                 wants_role: bool = False, *args, **kwargs):
-        super().__init__(title="Create a New Event", *args, **kwargs)
-        self.target_channel  = channel
-        self.recur_rule      = recur_rule
-        self.tz_name         = tz_name
-        self.reminder_offset = reminder_offset
-        self.wants_role      = wants_role
-
-        self.add_item(discord.ui.InputText(label="Event Title", placeholder="e.g. Weekly Raid Night", max_length=100))
-        self.add_item(discord.ui.InputText(label="Description (optional)", placeholder="What's happening? Any details...", style=discord.InputTextStyle.paragraph, required=False, max_length=500))
-        self.add_item(discord.ui.InputText(label="Start Date & Time", placeholder="2026-07-04 20:00  or  July 4 8pm  or  next Friday 9pm", max_length=50))
-        self.add_item(discord.ui.InputText(label="End Date & Time (optional)", placeholder="2026-07-04 21:00  or  July 4 9pm", required=False, max_length=50))
-        # Slot 5: role field takes priority; custom interval is fallback if no role wanted
-        if wants_role:
-            self.add_item(discord.ui.InputText(
-                label="Mention & Reminder Role",
-                placeholder="Role name, @Role, or role ID  (e.g. Members)",
-                max_length=100,
-            ))
-        elif recur_rule == "custom":
-            self.add_item(discord.ui.InputText(label="Repeat Interval (days)", placeholder="e.g. 14 for every 2 weeks", max_length=4))
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        guild_id = interaction.guild.id
-        premium  = is_premium(guild_id)
-
-        active_count = get_guild_event_count(guild_id)
-        if premium and active_count >= PREMIUM_EVENT_LIMIT:
-            await interaction.followup.send(
-                embed=build_error_embed(
-                    f"Premium servers are limited to **{PREMIUM_EVENT_LIMIT} active events**. "
-                    f"You currently have **{active_count}** — delete or wait for some to pass."
-                ),
-                ephemeral=True,
-            )
-            return
-        elif not premium and active_count >= FREE_EVENT_LIMIT:
-            await interaction.followup.send(
-                embed=build_error_embed(
-                    f"Free servers are limited to **{FREE_EVENT_LIMIT} active events** "
-                    f"({active_count}/{FREE_EVENT_LIMIT} used). "
-                    f"Delete an old event or upgrade to ⭐ Premium for up to {PREMIUM_EVENT_LIMIT}."
-                ),
-                ephemeral=True,
-            )
-            return
-
-        title       = self.children[0].value.strip()
-        description = self.children[1].value.strip() if self.children[1].value else ""
-        start_raw   = self.children[2].value.strip()
-        end_raw     = self.children[3].value.strip() if self.children[3].value else None
-
-        recur_interval  = 7
-        reminder_offset = self.reminder_offset
-        notify_role_id  = None
-
-        # Slot 5: resolve role OR custom interval depending on what was shown
-        if self.wants_role and len(self.children) > 4:
-            role_raw = self.children[4].value.strip() if self.children[4].value else ""
-            if role_raw:
-                try:
-                    role = interaction.guild.get_role(int(role_raw))
-                    if role:
-                        notify_role_id = role.id
-                except ValueError:
-                    clean = role_raw.lstrip("@").strip()
-                    role  = discord.utils.find(
-                        lambda r: r.name.lower() == clean.lower(),
-                        interaction.guild.roles,
-                    )
-                    if role:
-                        notify_role_id = role.id
-                if not notify_role_id:
-                    log.warning(
-                        f"NewEventModal: could not resolve role '{role_raw}' "
-                        f"in guild {interaction.guild.id} — creating event without role"
-                    )
-        elif not self.wants_role and self.recur_rule == "custom" and len(self.children) > 4:
-            try:
-                recur_interval = max(1, int(self.children[4].value.strip()))
-            except ValueError:
-                recur_interval = 7
-
-        # If wants_role + custom recur at the same time, role took slot 5 so
-        # recur_interval stays at default 7 — user can adjust via /editeventtime
-        custom_interval_note = ""
-        if self.wants_role and self.recur_rule == "custom":
-            custom_interval_note = "\n📝 Custom repeat interval defaulted to **7 days** — use `/editeventtime` to adjust."
-
-        start_dt = _parse_datetime(start_raw, self.tz_name)
-        if not start_dt:
-            await interaction.followup.send(
-                embed=build_error_embed("Couldn't parse the start date/time. Try `2026-07-04 20:00` or `July 4 8pm`."),
-                ephemeral=True,
-            )
-            return
-        start_iso = start_dt.isoformat()
-
-        end_iso = None
-        if end_raw:
-            end_dt = _parse_datetime(end_raw, self.tz_name)
-            if end_dt:
-                end_iso = end_dt.isoformat()
-
-        is_recurring = 0 if self.recur_rule == "none" else 1
-
-        tz_warning = ""
-        if self.tz_name == "UTC":
-            tz_warning = "\n⚠️ Event was created in **UTC**. Use `/editeventtime` to change the timezone if needed."
-
-        with get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO events
-                    (guild_id, channel_id, creator_id, title, description,
-                     timezone, start_time, end_time, is_recurring,
-                     recur_rule, recur_interval, reminder_offset, notify_role_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (guild_id, self.target_channel.id, interaction.user.id,
-                 title, description, self.tz_name, start_iso, end_iso,
-                 is_recurring, self.recur_rule, recur_interval,
-                 reminder_offset, notify_role_id),
-            )
-            event_id = cursor.lastrowid
-            conn.commit()
-
-        event = {
-            "id": event_id, "title": title, "description": description,
-            "timezone": self.tz_name, "start_time": start_iso, "end_time": end_iso,
-            "is_recurring": is_recurring, "recur_rule": self.recur_rule,
-            "recur_interval": recur_interval, "channel_id": self.target_channel.id,
-            "reminder_offset": reminder_offset, "notify_role_id": notify_role_id,
-            "btn_accept_label": "✅ Accept", "btn_decline_label": "❌ Decline",
-            "btn_tentative_label": "❓ Tentative", "btn_tentative_enabled": 1,
-        }
-
-        await post_event_embed(self.target_channel, event)
-
-        recur_str = RECUR_LABELS.get(self.recur_rule, self.recur_rule)
-        if self.recur_rule == "custom":
-            recur_str = f"Every {recur_interval} days"
-
-        log.info(f"Event created: '{title}' (ID {event_id}) in guild {guild_id} by {interaction.user}")
-
-        await interaction.followup.send(
-            embed=build_success_embed(
-                f"**{title}** created in {self.target_channel.mention}! "
-                f"(ID: `{event_id}` · {recur_str}){tz_warning}{custom_interval_note}"
-            ),
-            ephemeral=True,
-        )
-
-
-# ── Step 3 — Role ping selector ───────────────────────────────────────────────
-
-class RolePingSelectView(discord.ui.View):
-    """
-    Step 3 of /newevent.
-    Yes → NewEventModal with wants_role=True (role field appears as slot 5).
-    No  → NewEventModal with wants_role=False, no role, reminder defaults to 15 min.
-    Opening a second modal from a modal callback is blocked by Discord (error 50035),
-    so the role field is folded directly into NewEventModal instead.
-    """
-
-    def __init__(self, channel: discord.TextChannel, author_id: int,
-                 recur_rule: str, tz_name: str):
-        super().__init__(timeout=60)
-        self.channel    = channel
-        self.author_id  = author_id
-        self.recur_rule = recur_rule
-        self.tz_name    = tz_name
-
-    @discord.ui.select(placeholder="Mention / remind a role?", options=ROLE_PING_OPTIONS)
-    async def role_ping_select(self, select: discord.ui.Select, interaction: discord.Interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "Only the person who ran `/newevent` can use this menu.", ephemeral=True
-            )
-            return
-
-        self.stop()
-        wants_role = select.values[0] == "yes"
-
-        await interaction.response.send_modal(
-            NewEventModal(
-                channel=self.channel,
-                recur_rule=self.recur_rule,
-                tz_name=self.tz_name,
-                reminder_offset=DEFAULT_REMINDER_OFFSET,
-                wants_role=wants_role,
-            )
-        )
-
-
-# ── Step 2 — Timezone selector ────────────────────────────────────────────────
-
-class TimezoneSelectView(discord.ui.View):
-    def __init__(self, channel, author_id, recur_rule):
-        super().__init__(timeout=60)
-        self.channel    = channel
-        self.author_id  = author_id
-        self.recur_rule = recur_rule
-
-    @discord.ui.select(placeholder="Choose your timezone...", options=TIMEZONES)
-    async def tz_select(self, select, interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "Only the person who ran `/newevent` can use this menu.", ephemeral=True
-            )
-            return
-        self.stop()
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="📅  New Event — Step 3 of 4",
-                description=(
-                    "**Do you want to mention and remind a role?**\n\n"
-                    "🔔 **Yes** — A role will be pinged when the event posts "
-                    "and again when the reminder fires.\n"
-                    "🔕 **No** — No role ping. Skip straight to event details."
-                ),
-                color=COLOR_EVENT,
-            ),
-            view=RolePingSelectView(
-                channel=self.channel,
-                author_id=self.author_id,
-                recur_rule=self.recur_rule,
-                tz_name=select.values[0],
-            ),
-        )
-
-
-# ── Step 1 — Recurrence selector ─────────────────────────────────────────────
-
-class RecurrenceSelectView(discord.ui.View):
-    def __init__(self, channel, author_id):
-        super().__init__(timeout=60)
-        self.channel   = channel
-        self.author_id = author_id
-
-    @discord.ui.select(placeholder="Choose event type...", options=RECUR_OPTIONS)
-    async def recur_select(self, select, interaction):
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "Only the person who ran `/newevent` can use this menu.", ephemeral=True
-            )
-            return
-        self.stop()
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="📅  New Event — Step 2 of 4",
-                description="**Choose your timezone.**",
-                color=COLOR_EVENT,
-            ),
-            view=TimezoneSelectView(
-                channel=self.channel,
-                author_id=self.author_id,
-                recur_rule=select.values[0],
-            ),
-        )
-
-
 # ── Edit Event Details Modal ──────────────────────────────────────────────────
 
 class EditEventDetailsModal(discord.ui.Modal):
-    """
-    Edit title, description, max RSVPs, and notify role.
-    Opened by /editeventdetails.
-    """
+    """Edit title, description, max RSVPs, and notify role. Opened by /editeventdetails."""
 
     def __init__(self, event: dict, guild: discord.Guild, *args, **kwargs):
         super().__init__(title="Edit Event Details", *args, **kwargs)
@@ -600,7 +311,7 @@ class EditEventDetailsModal(discord.ui.Modal):
                 if role:
                     notify_role_id = role.id
         else:
-            notify_role_id = None  # blank = clear the role
+            notify_role_id = None
 
         with get_connection() as conn:
             conn.execute(
@@ -616,7 +327,7 @@ class EditEventDetailsModal(discord.ui.Modal):
 # ── Edit Event Time Modal ─────────────────────────────────────────────────────
 
 class EditEventTimeModal(discord.ui.Modal):
-    """Edit start time, end time, timezone, and reminder offset."""
+    """Edit start time, end time, timezone, and reminder offset. Opened by /editeventtime."""
 
     def __init__(self, event: dict, *args, **kwargs):
         super().__init__(title="Edit Event Time", *args, **kwargs)
@@ -748,11 +459,9 @@ class DeleteConfirmView(discord.ui.View):
                 await msg.delete()
         except discord.NotFound:
             pass
-
         with get_connection() as conn:
             conn.execute("DELETE FROM events WHERE id=?", (self.event["id"],))
             conn.commit()
-
         await interaction.response.edit_message(
             embed=build_success_embed(f"Event **{self.event['title']}** (ID: `{self.event['id']}`) has been deleted."),
             view=None,
@@ -856,14 +565,27 @@ class ListEventsView(discord.ui.View):
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Events(commands.Cog):
+    """Core event management commands."""
+
     def __init__(self, bot: discord.Bot):
         self.bot = bot
 
+    # ── /newevent ─────────────────────────────────────────────────────────
     @discord.slash_command(name="newevent", description="Create a new event.")
     async def newevent(
         self,
         ctx: discord.ApplicationContext,
         channel: discord.Option(discord.TextChannel, description="Channel to post the event in.", required=True),
+        title: discord.Option(str, description="Event title.", required=True, max_length=100),
+        start: discord.Option(str, description="Start date & time. e.g. 'July 4 8pm' or '2026-07-04 20:00'", required=True),
+        description: discord.Option(str, description="Event description (optional).", required=False, default=None),
+        end: discord.Option(str, description="End date & time (optional).", required=False, default=None),
+        timezone: discord.Option(str, description="Timezone (default: UTC). Start typing to search.", required=False, default="UTC", autocomplete=autocomplete_timezone),
+        recurrence: discord.Option(str, description="How often the event repeats (default: no repeat).", required=False, default="none", autocomplete=autocomplete_recurrence),
+        role: discord.Option(discord.Role, description="Role to ping on creation and at reminder time (optional).", required=False, default=None),
+        reminder: discord.Option(int, description="Minutes before start to send reminder (default: 15).", required=False, default=15),
+        max_rsvp: discord.Option(int, description="Max accepted RSVPs — 0 for unlimited (default: 0).", required=False, default=0),
+        recur_interval: discord.Option(int, description="Days between occurrences — only used if recurrence is 'custom'.", required=False, default=7),
     ):
         if not check_setup(ctx.guild.id):
             await ctx.respond(embed=build_error_embed("Run `/setup` first to configure Soren."), ephemeral=True)
@@ -872,13 +594,134 @@ class Events(commands.Cog):
             await ctx.respond(embed=build_error_embed("You don't have the Event Creator role."), ephemeral=True)
             return
 
-        embed = discord.Embed(
-            title="📅  New Event — Step 1 of 4",
-            description=f"Posting to: {channel.mention}\n\n**Select the event type below.**",
-            color=COLOR_EVENT,
-        )
-        await ctx.respond(embed=embed, view=RecurrenceSelectView(channel=channel, author_id=ctx.author.id), ephemeral=True)
+        # Defer immediately — dateparser can take a moment
+        await ctx.defer(ephemeral=True)
+        guild_id = ctx.guild.id
+        premium  = is_premium(guild_id)
 
+        # ── Tier cap check ────────────────────────────────────────────────
+        active_count = get_guild_event_count(guild_id)
+        if premium and active_count >= PREMIUM_EVENT_LIMIT:
+            await ctx.followup.send(
+                embed=build_error_embed(
+                    f"Premium servers are limited to **{PREMIUM_EVENT_LIMIT} active events**. "
+                    f"You currently have **{active_count}** — delete or wait for some to pass."
+                ),
+                ephemeral=True,
+            )
+            return
+        elif not premium and active_count >= FREE_EVENT_LIMIT:
+            await ctx.followup.send(
+                embed=build_error_embed(
+                    f"Free servers are limited to **{FREE_EVENT_LIMIT} active events** "
+                    f"({active_count}/{FREE_EVENT_LIMIT} used). "
+                    f"Delete an old event or upgrade to ⭐ Premium for up to {PREMIUM_EVENT_LIMIT}."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # ── Validate timezone ─────────────────────────────────────────────
+        tz_name = timezone or "UTC"
+        if tz_name not in pytz.all_timezones:
+            await ctx.followup.send(
+                embed=build_error_embed(
+                    f"Unknown timezone: `{tz_name}`.\n"
+                    "Start typing in the timezone field to see suggestions, "
+                    "or use a full tz name like `America/New_York`."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # ── Validate recurrence ───────────────────────────────────────────
+        valid_recurrences = {"none", "daily", "weekly", "biweekly", "bimonthly", "monthly", "custom"}
+        recur_rule = (recurrence or "none").lower()
+        if recur_rule not in valid_recurrences:
+            recur_rule = "none"
+
+        # ── Parse start time ──────────────────────────────────────────────
+        start_dt = _parse_datetime(start, tz_name)
+        if not start_dt:
+            await ctx.followup.send(
+                embed=build_error_embed(
+                    "Couldn't parse the start date/time.\n"
+                    "Try formats like `July 4 8pm`, `next Friday 9pm`, or `2026-07-04 20:00`."
+                ),
+                ephemeral=True,
+            )
+            return
+        start_iso = start_dt.isoformat()
+
+        # ── Parse end time ────────────────────────────────────────────────
+        end_iso = None
+        if end:
+            end_dt = _parse_datetime(end, tz_name)
+            if not end_dt:
+                await ctx.followup.send(
+                    embed=build_error_embed("Couldn't parse the end date/time."),
+                    ephemeral=True,
+                )
+                return
+            end_iso = end_dt.isoformat()
+
+        is_recurring    = 0 if recur_rule == "none" else 1
+        notify_role_id  = role.id if role else None
+        reminder_offset = max(1, reminder) if reminder else DEFAULT_REMINDER_OFFSET
+        recur_int       = max(1, recur_interval) if recur_interval else 7
+        desc_clean      = (description or "").strip()
+        max_rsvp_clean  = max(0, max_rsvp) if max_rsvp else 0
+
+        tz_warning = "\n⚠️ No timezone specified — event created in **UTC**. Use `/editeventtime` to change if needed." if tz_name == "UTC" and not timezone else ""
+
+        # ── Insert into DB ────────────────────────────────────────────────
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO events
+                    (guild_id, channel_id, creator_id, title, description,
+                     timezone, start_time, end_time, is_recurring,
+                     recur_rule, recur_interval, reminder_offset,
+                     notify_role_id, max_rsvp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (guild_id, channel.id, ctx.author.id,
+                 title, desc_clean, tz_name, start_iso, end_iso,
+                 is_recurring, recur_rule, recur_int,
+                 reminder_offset, notify_role_id, max_rsvp_clean),
+            )
+            event_id = cursor.lastrowid
+            conn.commit()
+
+        event = {
+            "id": event_id, "title": title, "description": desc_clean,
+            "timezone": tz_name, "start_time": start_iso, "end_time": end_iso,
+            "is_recurring": is_recurring, "recur_rule": recur_rule,
+            "recur_interval": recur_int, "channel_id": channel.id,
+            "reminder_offset": reminder_offset, "notify_role_id": notify_role_id,
+            "max_rsvp": max_rsvp_clean,
+            "btn_accept_label": "✅ Accept", "btn_decline_label": "❌ Decline",
+            "btn_tentative_label": "❓ Tentative", "btn_tentative_enabled": 1,
+        }
+
+        await post_event_embed(channel, event)
+
+        recur_str = RECUR_LABELS.get(recur_rule, recur_rule)
+        if recur_rule == "custom":
+            recur_str = f"Every {recur_int} days"
+
+        role_str = f" · pinging {role.mention}" if role else ""
+        log.info(f"Event created: '{title}' (ID {event_id}) in guild {guild_id} by {ctx.author}")
+
+        await ctx.followup.send(
+            embed=build_success_embed(
+                f"**{title}** created in {channel.mention}! "
+                f"(ID: `{event_id}` · {recur_str}{role_str}){tz_warning}"
+            ),
+            ephemeral=True,
+        )
+
+    # ── /editeventdetails ─────────────────────────────────────────────────
     @discord.slash_command(name="editeventdetails", description="Edit an event's title, description, max RSVPs, or notify role.")
     async def editeventdetails(
         self,
@@ -895,6 +738,7 @@ class Events(commands.Cog):
             return
         await ctx.send_modal(EditEventDetailsModal(event=dict(row), guild=ctx.guild))
 
+    # ── /editeventtime ────────────────────────────────────────────────────
     @discord.slash_command(name="editeventtime", description="Edit an event's start/end time, timezone, or reminder.")
     async def editeventtime(
         self,
@@ -911,6 +755,7 @@ class Events(commands.Cog):
             return
         await ctx.send_modal(EditEventTimeModal(event=dict(row)))
 
+    # ── /deleteevent ──────────────────────────────────────────────────────
     @discord.slash_command(name="deleteevent", description="Delete an event permanently.")
     async def deleteevent(
         self,
@@ -933,6 +778,7 @@ class Events(commands.Cog):
         )
         await ctx.respond(embed=embed, view=DeleteConfirmView(event=event, author_id=ctx.author.id), ephemeral=True)
 
+    # ── /listevents ───────────────────────────────────────────────────────
     @discord.slash_command(name="listevents", description="List all upcoming events in this server.")
     async def listevents(self, ctx: discord.ApplicationContext):
         now = datetime.now(timezone.utc)
@@ -951,6 +797,7 @@ class Events(commands.Cog):
             view = ListEventsView(rows, ctx.guild, ctx.author.id)
             await ctx.respond(embed=view._build_embed(), view=view, ephemeral=True)
 
+    # ── /eventbuttons ─────────────────────────────────────────────────────
     @discord.slash_command(name="eventbuttons", description="Customize RSVP button labels and toggle the Tentative button.")
     async def eventbuttons(
         self,
@@ -967,6 +814,7 @@ class Events(commands.Cog):
             return
         await ctx.send_modal(EventButtonsModal(event=dict(row), premium=is_premium(ctx.guild.id)))
 
+    # ── /cancelevent ──────────────────────────────────────────────────────
     @discord.slash_command(name="cancelevent", description="Soft cancel an event (marks as cancelled without deleting).")
     async def cancelevent(
         self,
@@ -995,6 +843,7 @@ class Events(commands.Cog):
         from cogs.rsvp import refresh_event_embed
         await refresh_event_embed(event_id, ctx.guild, ctx.bot)
 
+    # ── /myevents ─────────────────────────────────────────────────────────
     @discord.slash_command(name="myevents", description="List events you've RSVPed to in this server.")
     async def myevents(self, ctx: discord.ApplicationContext):
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1022,6 +871,7 @@ class Events(commands.Cog):
             )
         await ctx.respond(embed=embed, ephemeral=True)
 
+    # ── /exportevents ─────────────────────────────────────────────────────
     @discord.slash_command(name="exportevents", description="Export upcoming events as an .ics calendar file.")
     async def exportevents(self, ctx: discord.ApplicationContext):
         now_iso = datetime.now(timezone.utc).isoformat()

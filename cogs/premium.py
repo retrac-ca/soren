@@ -91,7 +91,7 @@ class Premium(commands.Cog):
                 f"• Up to **{PREMIUM_EVENT_LIMIT}** active events\n"
                 "• Up to **100** RSVP names displayed\n"
                 "• All 10 embed colors\n"
-                "• Up to **20** G-Cal integrations\n"
+                "• Up to **10** G-Cal integrations\n"
                 "• Mention/remind up to **3 roles** per event\n"
                 "• Custom RSVP button labels\n\n"
                 "Run `/config` to confirm your server's plan."
@@ -203,7 +203,7 @@ class Premium(commands.Cog):
         embed.add_field(
             name="\U0001f4c5  Events (Event Creator role required)",
             value=(
-                "`/newevent` \u2014 Create a new event\n"
+                "`/newevent` \u2014 Create a new event (inline — fill in title, time, timezone, role and more)\n"
                 "`/editeventdetails` \u2014 Edit title, description, max RSVPs, notify role\n"
                 "`/editeventtime` \u2014 Edit start/end time, timezone, reminder\n"
                 "`/deleteevent` \u2014 Delete an event\n"
