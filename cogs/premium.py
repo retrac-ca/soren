@@ -204,8 +204,9 @@ class Premium(commands.Cog):
             name="\U0001f4c5  Events (Event Creator role required)",
             value=(
                 "`/newevent` \u2014 Create a new event (inline — fill in title, time, timezone, role and more)\n"
-                "`/editeventdetails` \u2014 Edit title, description, max RSVPs, notify role\n"
+                "`/editeventdetails` \u2014 Edit title, description, and max RSVPs\n"
                 "`/editeventtime` \u2014 Edit start/end time, timezone, reminder\n"
+                "`/editeventmentions` \u2014 Update or clear the mention/reminder role(s)\n"
                 "`/deleteevent` \u2014 Delete an event\n"
                 "`/cancelevent` \u2014 Soft cancel an event\n"
                 "`/listevents` \u2014 View all upcoming events\n"

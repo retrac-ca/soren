@@ -145,7 +145,10 @@ async def autocomplete_recurrence(ctx: discord.AutocompleteContext):
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
 def build_listevents_embed(rows, guild):
-    embed = discord.Embed(title="📅  Upcoming Events", color=COLOR_EVENT)
+    from utils.embeds import get_guild_color
+    cfg   = get_guild_config(guild.id)
+    color = get_guild_color(cfg.get("embed_color") if cfg else None)
+    embed = discord.Embed(title="📅  Upcoming Events", color=color)
     for row in rows:
         try:
             tz = pytz.timezone(row["timezone"] or "UTC")
@@ -489,6 +492,95 @@ class EventButtonsModal(discord.ui.Modal):
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
 
 
+# ── Edit Event Mentions Modal ─────────────────────────────────────────────────
+
+class EditEventMentionsModal(discord.ui.Modal):
+    """
+    Dedicated modal for editing mention/reminder roles on an event.
+    Opened by /editeventmentions.
+    Free:    1 role max.
+    Premium: up to 3 roles (comma-separated).
+    Leave blank to clear all roles.
+    """
+
+    def __init__(self, event: dict, guild: discord.Guild, *args, **kwargs):
+        super().__init__(title="Edit Mention & Reminder Roles", *args, **kwargs)
+        self.event   = event
+        self.guild   = guild
+        self.premium = is_premium(guild.id)
+
+        existing_role_ids = _parse_role_ids(event)
+        role_names = []
+        for rid in existing_role_ids:
+            r = guild.get_role(rid)
+            if r:
+                role_names.append(r.name)
+
+        placeholder = (
+            "Up to 3 roles — e.g.  Members, Officers, Raid Team  (leave blank to clear all)"
+            if self.premium else
+            "Role name, @Role, or role ID — leave blank to clear"
+        )
+
+        self.add_item(discord.ui.InputText(
+            label="Mention & Reminder Role(s)",
+            value=", ".join(role_names),
+            placeholder=placeholder,
+            required=False,
+            max_length=200,
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        from cogs.rsvp import refresh_event_embed
+        await interaction.response.defer(ephemeral=True)
+
+        roles_raw = self.children[0].value.strip()
+        role_ids  = []
+
+        if roles_raw:
+            max_roles = 3 if self.premium else 1
+            parts = [p.strip() for p in roles_raw.split(",") if p.strip()]
+            for part in parts[:max_roles]:
+                resolved = None
+                try:
+                    r = interaction.guild.get_role(int(part))
+                    if r:
+                        resolved = r.id
+                except ValueError:
+                    clean = part.lstrip("@").strip()
+                    r = discord.utils.find(
+                        lambda r: r.name.lower() == clean.lower(),
+                        interaction.guild.roles,
+                    )
+                    if r:
+                        resolved = r.id
+                if resolved:
+                    role_ids.append(resolved)
+
+        notify_role_id  = role_ids[0] if role_ids else None
+        notify_role_ids = json.dumps(role_ids) if role_ids else None
+
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE events SET notify_role_id=?, notify_role_ids=? WHERE id=?",
+                (notify_role_id, notify_role_ids, self.event["id"]),
+            )
+            conn.commit()
+
+        if role_ids:
+            names = []
+            for rid in role_ids:
+                r = interaction.guild.get_role(rid)
+                if r:
+                    names.append(r.mention)
+            msg = f"Mention & reminder roles updated to: {', '.join(names)}"
+        else:
+            msg = "Mention & reminder roles cleared."
+
+        await interaction.followup.send(embed=build_success_embed(msg), ephemeral=True)
+        await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
+
+
 # ── Delete confirmation view ──────────────────────────────────────────────────
 
 class DeleteConfirmView(discord.ui.View):
@@ -567,6 +659,7 @@ class ListEventsView(discord.ui.View):
         super().__init__(timeout=300)
         self.rows      = rows
         self.guild     = guild
+        self.guild_id  = guild.id
         self.author_id = author_id
         self.page      = 0
         self.page_size = 10
@@ -595,7 +688,10 @@ class ListEventsView(discord.ui.View):
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
     def _build_embed(self):
-        embed = discord.Embed(title="📅  Upcoming Events", color=COLOR_EVENT)
+        from utils.embeds import get_guild_color
+        cfg   = get_guild_config(self.guild_id)
+        color = get_guild_color(cfg.get("embed_color") if cfg else None)
+        embed = discord.Embed(title="📅  Upcoming Events", color=color)
         start = self.page * self.page_size
         for row in self.rows[start:start + self.page_size]:
             try:
@@ -747,7 +843,7 @@ class Events(commands.Cog):
         notify_role_id  = role_ids[0] if role_ids else None
         notify_role_ids = json.dumps(role_ids) if role_ids else None
 
-        tz_warning = "\n⚠️ No timezone specified — event created in **UTC**. Use `/editeventtime` to change if needed." if tz_name == "UTC" and not timezone else ""
+        tz_warning = "\n⚠️ No timezone specified — event created in **UTC**. Use `/editeventtime` to change if needed." if tz_name == "UTC" and timezone is None else ""
 
         # ── Insert into DB ────────────────────────────────────────────────
         with get_connection() as conn:
@@ -782,6 +878,14 @@ class Events(commands.Cog):
         }
 
         await post_event_embed(channel, event)
+
+        # Push to primary Google Calendar if connected
+        try:
+            gcal_cog = ctx.bot.cogs.get("GoogleCal")
+            if gcal_cog:
+                await gcal_cog.push_event_to_gcal(guild_id, event)
+        except Exception as e:
+            log.warning(f"GCal push failed for event {event_id}: {e}")
 
         recur_str = RECUR_LABELS.get(recur_rule, recur_rule)
         if recur_rule == "custom":
@@ -832,6 +936,23 @@ class Events(commands.Cog):
             await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
             return
         await ctx.send_modal(EditEventTimeModal(event=dict(row)))
+
+    # ── /editeventmentions ────────────────────────────────────────────────
+    @discord.slash_command(name="editeventmentions", description="Update the mention/reminder role(s) for an event, or clear them.")
+    async def editeventmentions(
+        self,
+        ctx: discord.ApplicationContext,
+        event_id: discord.Option(int, description="The event ID to update.", autocomplete=autocomplete_event_ids, required=True),
+    ):
+        if not is_event_creator(ctx.author):
+            await ctx.respond(embed=build_error_embed("You don't have the Event Creator role."), ephemeral=True)
+            return
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM events WHERE id=? AND guild_id=?", (event_id, ctx.guild.id)).fetchone()
+        if not row:
+            await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
+            return
+        await ctx.send_modal(EditEventMentionsModal(event=dict(row), guild=ctx.guild))
 
     # ── /deleteevent ──────────────────────────────────────────────────────
     @discord.slash_command(name="deleteevent", description="Delete an event permanently.")

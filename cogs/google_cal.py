@@ -5,13 +5,11 @@ Google Calendar integration.
 
 What this cog does
 ------------------
-1. /gcal connect  — Walks the user through connecting a Google Calendar
-                    (generates an OAuth URL they paste their code back from).
-2. /gcal disconnect — Removes the stored token.
-3. Background sync — Every 15 minutes, pulls new events from Google Calendar
-                     and posts them in Discord (without RSVP buttons, as per spec).
-4. push_to_gcal()  — Called by the events cog after a new event is created
-                     via /newevent, to mirror it in Google Calendar.
+1. /gcal connect    — OAuth flow: generates auth URL
+2. /gcal verify     — Exchanges auth code, then shows a calendar picker dropdown
+3. /gcal disconnect — Removes the stored token and calendar ID
+4. Background sync  — Every 15 minutes, pulls new Google Calendar events and posts them
+5. push_to_gcal()   — Called by the events cog after /newevent to mirror it in Google Calendar
 
 NOTE
 ----
@@ -44,7 +42,7 @@ except ImportError:
     log.warning("google-auth / google-api-python-client not installed. "
                 "Google Calendar integration will be unavailable.")
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES     = ["https://www.googleapis.com/auth/calendar"]
 CREDS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 
 # Store in-progress OAuth flows keyed by guild_id
@@ -55,6 +53,59 @@ def _get_service(token_json: str):
     """Build and return an authenticated Google Calendar service object."""
     creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
     return gcal_build("calendar", "v3", credentials=creds)
+
+
+# ── Calendar picker view (shown after /gcal verify) ───────────────────────────
+
+class GcalPickerView(discord.ui.View):
+    """
+    Dropdown listing all calendars on the authenticated Google account.
+    User selects which one to use for two-way sync with /newevent.
+    Capped at 25 (Discord select limit).
+    """
+
+    def __init__(self, guild_id: int, token_json: str, calendars: list[dict]):
+        super().__init__(timeout=120)
+        self.guild_id   = guild_id
+        self.token_json = token_json
+
+        options = []
+        for cal in calendars[:25]:
+            is_primary = cal.get("primary", False)
+            emoji      = "⭐" if is_primary else "📅"
+            options.append(discord.SelectOption(
+                label=cal.get("summary", "Unnamed Calendar")[:100],
+                value=cal["id"],
+                emoji=emoji,
+                description="Primary calendar" if is_primary else None,
+            ))
+
+        select = discord.ui.Select(
+            placeholder="Choose a calendar to sync with /newevent...",
+            options=options,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        cal_id   = interaction.data["values"][0]
+        cal_name = next(
+            (o.label for o in self.children[0].options if o.value == cal_id),
+            cal_id,
+        )
+
+        upsert_guild_config(self.guild_id, gcal_token=self.token_json, gcal_id=cal_id)
+        log.info(f"gcal: guild {self.guild_id} connected primary calendar '{cal_name}' ({cal_id})")
+
+        self.stop()
+        await interaction.response.edit_message(
+            embed=build_success_embed(
+                f"Google Calendar connected!\n\n"
+                f"**Syncing with:** `{cal_name}`\n\n"
+                "New events created with `/newevent` will automatically be pushed to this calendar."
+            ),
+            view=None,
+        )
 
 
 class GoogleCal(commands.Cog):
@@ -97,23 +148,21 @@ class GoogleCal(commands.Cog):
             )
             return
 
-        # Build the OAuth flow
         flow = Flow.from_client_secrets_file(
-            CREDS_FILE, scopes=SCOPES,
-            redirect_uri="http://localhost"
+            CREDS_FILE, scopes=SCOPES, redirect_uri="http://localhost"
         )
         auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
         _pending_flows[ctx.guild.id] = flow
 
         embed = discord.Embed(
-            title="🔗 Connect Google Calendar",
+            title="🔗  Connect Google Calendar",
             description=(
+                "**Steps:**\n"
                 "1. Click the link below and sign in with Google.\n"
-                "2. After authorizing, your browser will redirect to a `localhost` page "
-                "that shows **'This site can't be reached'** — that's normal!\n"
-                "3. Copy the `code=` value from the URL in your browser's address bar.\n"
-                "   *(It looks like: `http://localhost/?code=4/0Ab...&scope=...`)*\n"
-                "4. Run `/gcal verify` and paste just the code value.\n\n"
+                "2. After authorizing, your browser will show **'This site can't be reached'** — that's normal!\n"
+                "3. Copy the `code=` value from your browser's address bar.\n"
+                "   *(The URL looks like: `http://localhost/?code=4/0Ab...&scope=...`)*\n"
+                "4. Run `/gcal verify` and paste just the code.\n\n"
                 f"[Click here to authorize Google Calendar]({auth_url})"
             ),
             color=COLOR_EVENT,
@@ -128,7 +177,7 @@ class GoogleCal(commands.Cog):
         ctx: discord.ApplicationContext,
         code: discord.Option(str, "The authorization code from Google."),
     ):
-        """Step 2 of OAuth: exchange the auth code for a token."""
+        """Step 2 of OAuth: exchange the auth code, then show a calendar picker."""
         flow = _pending_flows.pop(ctx.guild.id, None)
         if not flow:
             await ctx.respond(
@@ -142,27 +191,38 @@ class GoogleCal(commands.Cog):
             token_json = flow.credentials.to_json()
         except Exception as e:
             await ctx.respond(
-                embed=build_error_embed(f"Failed to exchange code: {e}"),
+                embed=build_error_embed(f"Failed to exchange auth code: `{e}`"),
                 ephemeral=True,
             )
             return
 
-        # Get the user's primary calendar ID
+        # Fetch all calendars for the picker
         try:
-            service  = _get_service(token_json)
-            calendar = service.calendars().get(calendarId="primary").execute()
-            cal_id   = calendar["id"]
+            service   = _get_service(token_json)
+            cal_list  = service.calendarList().list().execute()
+            calendars = cal_list.get("items", [])
         except Exception as e:
             await ctx.respond(
-                embed=build_error_embed(f"Connected but couldn't fetch calendar: {e}"),
+                embed=build_error_embed(f"Authorized but couldn't fetch calendar list: `{e}`"),
                 ephemeral=True,
             )
             return
 
-        upsert_guild_config(ctx.guild.id, gcal_token=token_json, gcal_id=cal_id)
+        embed = discord.Embed(
+            title="📅  Choose a Calendar",
+            description=(
+                "Authorization successful! Select which calendar to use for two-way sync.\n"
+                "Events created with `/newevent` will be pushed into this calendar.\n\n"
+                "⭐ = Primary calendar"
+            ),
+            color=COLOR_EVENT,
+        )
         await ctx.respond(
-            embed=build_success_embed(
-                f"Google Calendar connected! Syncing with: `{cal_id}`"
+            embed=embed,
+            view=GcalPickerView(
+                guild_id=ctx.guild.id,
+                token_json=token_json,
+                calendars=calendars,
             ),
             ephemeral=True,
         )
@@ -182,10 +242,7 @@ class GoogleCal(commands.Cog):
     async def sync_loop(self):
         """
         Every 15 minutes: pull new Google Calendar events for all connected guilds
-        and post them in the guild's system/first text channel.
-
-        Events pulled from Google Calendar do NOT get RSVP buttons
-        (as per spec — users must create events via /newevent for signups).
+        and post them as informational embeds (no RSVP buttons).
         """
         log.debug("Running Google Calendar sync...")
 
@@ -204,7 +261,6 @@ class GoogleCal(commands.Cog):
                 service = _get_service(token_json)
                 now     = datetime.now(timezone.utc).isoformat()
 
-                # Fetch events starting from now
                 result = service.events().list(
                     calendarId=cal_id,
                     timeMin=now,
@@ -216,7 +272,6 @@ class GoogleCal(commands.Cog):
                 for item in result.get("items", []):
                     gcal_event_id = item["id"]
 
-                    # Check if we've already posted this event
                     with get_connection() as conn:
                         existing = conn.execute(
                             "SELECT id FROM events WHERE gcal_event_id=? AND guild_id=?",
@@ -224,7 +279,7 @@ class GoogleCal(commands.Cog):
                         ).fetchone()
 
                     if existing:
-                        continue  # Already synced
+                        continue
 
                     await self._post_gcal_event(guild_id, item, gcal_event_id)
 
@@ -241,7 +296,6 @@ class GoogleCal(commands.Cog):
         if not guild:
             return
 
-        # Find a channel to post in (system channel or first text channel)
         channel = guild.system_channel
         if not channel:
             for ch in guild.text_channels:
@@ -273,7 +327,6 @@ class GoogleCal(commands.Cog):
 
         msg = await channel.send(embed=embed)
 
-        # Save to DB (no RSVP buttons / signups for gcal-sourced events)
         with get_connection() as conn:
             conn.execute(
                 """
@@ -284,7 +337,7 @@ class GoogleCal(commands.Cog):
                 """,
                 (
                     guild_id, channel.id, msg.id,
-                    self.bot.user.id,    # Creator = the bot itself for gcal events
+                    self.bot.user.id,
                     title, description, start_str, gcal_event_id,
                 ),
             )
@@ -301,19 +354,23 @@ class GoogleCal(commands.Cog):
 
         cfg = get_guild_config(guild_id)
         if not cfg or not cfg.get("gcal_token") or not cfg.get("gcal_id"):
-            return  # No calendar connected
+            return  # No calendar connected — silently skip
 
         try:
             service = _get_service(cfg["gcal_token"])
             body = {
-                "summary": event["title"],
+                "summary":     event["title"],
                 "description": event.get("description", ""),
-                "start": {"dateTime": event["start_time"], "timeZone": event.get("timezone", "UTC")},
-                "end":   {"dateTime": event.get("end_time") or event["start_time"],
-                          "timeZone": event.get("timezone", "UTC")},
+                "start": {
+                    "dateTime": event["start_time"],
+                    "timeZone": event.get("timezone", "UTC"),
+                },
+                "end": {
+                    "dateTime": event.get("end_time") or event["start_time"],
+                    "timeZone": event.get("timezone", "UTC"),
+                },
             }
             created = service.events().insert(calendarId=cfg["gcal_id"], body=body).execute()
-            # Save the Google Calendar event ID back to the database
             with get_connection() as conn:
                 conn.execute(
                     "UPDATE events SET gcal_event_id=? WHERE id=?",

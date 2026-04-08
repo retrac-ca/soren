@@ -75,7 +75,7 @@ class Reminders(commands.Cog):
         Uses a 5-minute lookback window so missed reminders still fire
         if the bot was briefly offline.
         """
-        now_utc     = datetime.now(timezone.utc).replace(tzinfo=pytz.utc)
+        now_utc     = datetime.now(timezone.utc)
         now_minus_5 = now_utc - timedelta(minutes=5)
         now_plus_2h = now_utc + timedelta(hours=2)
 
@@ -91,8 +91,11 @@ class Reminders(commands.Cog):
 
             try:
                 start_dt = datetime.fromisoformat(event["start_time"])
+                # Always ensure start_dt is timezone-aware for comparison
                 if start_dt.tzinfo is None:
-                    start_dt = pytz.utc.localize(start_dt)
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                else:
+                    start_dt = start_dt.astimezone(timezone.utc)
             except ValueError:
                 continue
 
