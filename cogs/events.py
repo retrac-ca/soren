@@ -71,8 +71,9 @@ try:
 except ImportError:
     HAS_DATEUTIL = False
 
-# ── Free tier limit ───────────────────────────────────────────────────────────
-FREE_EVENT_LIMIT = 10
+# ── Tier event limits ─────────────────────────────────────────────────────────
+FREE_EVENT_LIMIT    = 10
+PREMIUM_EVENT_LIMIT = 50
 
 # ── RSVP cooldown tracking (in-memory, per user per event) ───────────────────
 # key: (user_id, event_id) → timestamp of last interaction
