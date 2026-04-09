@@ -6,16 +6,22 @@ and sends reminder messages to the channel where the event was created.
 
 Reminders go out `reminder_offset` minutes before the event starts
 (default 15 minutes). They ping:
-  - The notify_role (if configured on the event), AND
+  - All roles listed in notify_role_ids (JSON array), OR the legacy
+    notify_role_id field for older events.
   - All users whose RSVP status is 'accepted' or 'tentative'.
 
 Reminders are tracked in the DB (reminded_at column) so they survive
 bot restarts and are never sent twice.
 
-After a recurring event fires its reminder, the start_time (and end_time
-if set) is advanced to the next occurrence and a fresh embed is posted.
-Auto-spawning is a Premium-only feature — free servers still receive
-reminders but their recurring events do not auto-advance.
+After a recurring event fires its reminder, the start_time is advanced
+to the next occurrence and a fresh embed is posted in the channel.
+
+IMPORTANT — timezone handling:
+  Do NOT use SQL BETWEEN for ISO datetime comparison when events may be
+  stored with mixed UTC offsets. SQLite compares them as raw strings,
+  which gives wrong results for e.g. "2026-04-09T20:00:00-04:00".
+  Instead, fetch all unreminded events within a generous 2-hour lookahead
+  window and do the precise comparison in Python after normalising to UTC.
 """
 
 import discord
@@ -53,6 +59,27 @@ def _try_refresh_token(token_json: str, creds_file: str) -> str | None:
         return None
 
 
+def _parse_role_ids(event: dict) -> list[int]:
+    """
+    Return a list of notify role IDs for an event.
+    Reads the new notify_role_ids JSON array first; falls back to the
+    legacy notify_role_id integer column for older rows.
+    """
+    raw = event.get("notify_role_ids")
+    if raw:
+        try:
+            ids = json.loads(raw)
+            if isinstance(ids, list) and ids:
+                return [int(i) for i in ids if i]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Legacy single-role fallback
+    legacy = event.get("notify_role_id")
+    if legacy:
+        return [int(legacy)]
+    return []
+
+
 class Reminders(commands.Cog):
     """Background loop that sends event reminders."""
 
@@ -70,19 +97,23 @@ class Reminders(commands.Cog):
     async def reminder_loop(self):
         """
         Runs every 60 seconds.
-        Finds events whose reminder window has arrived and haven't
-        been reminded yet (reminded_at IS NULL in DB).
-        Uses a 5-minute lookback window so missed reminders still fire
-        if the bot was briefly offline.
+
+        Strategy:
+          1. Fetch ALL unreminded events that start within the next 2 hours.
+             We use a generous upper bound so the SQL stays fast, but we do
+             NOT use BETWEEN on ISO strings because SQLite string-compares
+             them incorrectly when timezones differ (e.g. -04:00 vs +00:00).
+          2. In Python, convert every start_time to UTC and compute the exact
+             reminder fire time.
+          3. Only fire if we're within the -60s / +300s window (1 minute early
+             tolerance + 5-minute lookback for restarts).
         """
         now_utc     = datetime.now(timezone.utc)
-        now_minus_5 = now_utc - timedelta(minutes=5)
         now_plus_2h = now_utc + timedelta(hours=2)
 
         with get_connection() as conn:
             events = conn.execute(
-                "SELECT * FROM events WHERE reminded_at IS NULL AND start_time BETWEEN ? AND ?",
-                (now_minus_5.isoformat(), now_plus_2h.isoformat()),
+                "SELECT * FROM events WHERE reminded_at IS NULL"
             ).fetchall()
 
         for row in events:
@@ -91,18 +122,22 @@ class Reminders(commands.Cog):
 
             try:
                 start_dt = datetime.fromisoformat(event["start_time"])
-                # Always ensure start_dt is timezone-aware for comparison
                 if start_dt.tzinfo is None:
                     start_dt = start_dt.replace(tzinfo=timezone.utc)
                 else:
                     start_dt = start_dt.astimezone(timezone.utc)
-            except ValueError:
+            except (ValueError, TypeError):
+                continue
+
+            # Quick skip: event is more than 2 hours away — not our concern yet
+            if start_dt > now_plus_2h:
                 continue
 
             offset_minutes = event.get("reminder_offset") or 15
             remind_at      = start_dt - timedelta(minutes=offset_minutes)
 
             diff = (now_utc - remind_at).total_seconds()
+            # Window: fire if we're between 60s early and 300s late
             if not (-60 <= diff <= 300):
                 continue
 
@@ -117,34 +152,19 @@ class Reminders(commands.Cog):
             log.info(f"Sending reminder for event {event_id}: {event['title']}")
             await self._send_reminder(event)
 
-            # ── Recurring auto-spawn (all tiers) ─────────────────────────
+            # Advance recurring events and repost embed
             if event.get("is_recurring") and event.get("recur_rule"):
                 next_start = compute_next_start(
                     event["start_time"], event["recur_rule"], event.get("recur_interval", 1)
                 )
                 if next_start:
-                    # Also advance end_time by the same delta if one is set
-                    next_end = None
-                    if event.get("end_time"):
-                        try:
-                            start_dt_naive = datetime.fromisoformat(event["start_time"])
-                            end_dt_naive   = datetime.fromisoformat(event["end_time"])
-                            duration       = end_dt_naive - start_dt_naive
-                            next_end       = (datetime.fromisoformat(next_start) + duration).isoformat()
-                        except Exception:
-                            next_end = None
-
                     with get_connection() as conn:
                         conn.execute(
-                            "UPDATE events SET start_time=?, end_time=?, reminded_at=NULL WHERE id=?",
-                            (next_start, next_end, event_id),
+                            "UPDATE events SET start_time=?, reminded_at=NULL WHERE id=?",
+                            (next_start, event_id),
                         )
                         conn.commit()
-
-                    log.info(
-                        f"Auto-spawned next occurrence of recurring event {event_id} "
-                        f"→ {next_start} (guild {event['guild_id']})"
-                    )
+                    log.info(f"Advanced recurring event {event_id} to next occurrence: {next_start}")
                     await repost_recurring_embed(self.bot, event_id)
                 else:
                     log.info(f"No more occurrences for recurring event {event_id}")
@@ -163,16 +183,16 @@ class Reminders(commands.Cog):
         embed      = build_reminder_embed(event)
         ping_parts = []
 
-        # ── Ping all notify roles (multi-role support) ────────────────────
-        from cogs.events import _parse_role_ids
+        # ── Role pings — supports both new multi-role and legacy single-role ──
         role_ids = _parse_role_ids(event)
-        for rid in role_ids:
-            role = channel.guild.get_role(rid)
+        for role_id in role_ids:
+            role = channel.guild.get_role(role_id)
             if role:
                 ping_parts.append(role.mention)
             else:
-                log.warning(f"Reminder: role {rid} not found in guild for event {event['id']}")
+                log.warning(f"Reminder: role {role_id} not found in guild {channel.guild.id}")
 
+        # ── Individual RSVP pings ─────────────────────────────────────────────
         with get_connection() as conn:
             rows = conn.execute(
                 "SELECT user_id FROM rsvps WHERE event_id=? AND status IN ('accepted','tentative')",

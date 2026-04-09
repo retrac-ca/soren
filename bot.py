@@ -18,26 +18,24 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
-# Logs go to both the console (stdout) and a monthly rotating file.
-# A new log file is created each month: logs/soren_YYYY_MM.log
-# Files are kept for 24 months before being automatically removed.
+# Logs go to both the console (stdout) and a daily rotating file.
+# A new log file is created each day: logs/soren_YYYY_MM_DD.log
+# Files are kept for 30 days before being automatically removed.
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 LOG_DIR     = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
-class MonthlyRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+class DailyRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
     """
-    Rotates log files at the start of each calendar month.
-    TimedRotatingFileHandler with 'midnight' + interval=1 rolls daily by default;
-    we override namer and the rotation check to give us monthly files named
-    soren_YYYY_MM.log instead.
+    Rotates log files at midnight each day.
+    Files are named soren_YYYY_MM_DD.log.
+    Old files beyond backup_count days are removed automatically.
     """
 
-    def __init__(self, log_dir: str, backup_count: int = 24):
-        # Use the current month's filename as the base file
-        filename = self._month_filename(log_dir)
+    def __init__(self, log_dir: str, backup_count: int = 30):
+        filename = self._day_filename(log_dir)
         super().__init__(
             filename=filename,
             when="midnight",
@@ -49,21 +47,21 @@ class MonthlyRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
         self.log_dir = log_dir
 
     @staticmethod
-    def _month_filename(log_dir: str) -> str:
+    def _day_filename(log_dir: str) -> str:
         now = datetime.now()
-        return os.path.join(log_dir, f"soren_{now.strftime('%Y_%m')}.log")
+        return os.path.join(log_dir, f"soren_{now.strftime('%Y_%m_%d')}.log")
 
     def shouldRollover(self, record) -> int:
-        """Roll over when the calendar month changes."""
-        expected = self._month_filename(self.log_dir)
+        """Roll over when the calendar day changes."""
+        expected = self._day_filename(self.log_dir)
         return 1 if self.baseFilename != expected else 0
 
     def doRollover(self):
-        """Switch to the new month's file."""
+        """Switch to the new day's file."""
         if self.stream:
             self.stream.close()
             self.stream = None
-        self.baseFilename = self._month_filename(self.log_dir)
+        self.baseFilename = self._day_filename(self.log_dir)
         self.stream = self._open()
 
 
@@ -78,8 +76,8 @@ def _setup_logging():
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
 
-    # Monthly file handler
-    file_handler = MonthlyRotatingFileHandler(LOG_DIR, backup_count=24)
+    # Daily file handler
+    file_handler = DailyRotatingFileHandler(LOG_DIR, backup_count=30)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
@@ -102,6 +100,7 @@ COGS = [
     "cogs.gcal_integrations",
     "cogs.premium",
     "cogs.ping",
+    "cogs.logs",
 ]
 
 

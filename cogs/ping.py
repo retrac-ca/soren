@@ -1,3 +1,6 @@
+## soren/cogs/ping.py
+
+
 """
 cogs/ping.py
 =============
@@ -12,7 +15,7 @@ import logging
 
 log = logging.getLogger("soren.ping")
 
-BOT_VERSION = "1.2"
+BOT_VERSION = "4.0"
 SUPPORT_URL = "https://soren.retrac.ca"
 CREATOR     = "Toadle"
 

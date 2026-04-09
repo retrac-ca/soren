@@ -25,7 +25,7 @@ FREE_COLORS = {
     "Green":  discord.Color.from_rgb(87,  242, 135),
 }
 
-# Premium color options (includes free + extras = 10 total)
+# Premium color options (includes free 3 + 7 more = 10 total)
 PREMIUM_COLORS = {
     **FREE_COLORS,
     "Gold":   discord.Color.from_rgb(255, 184,  28),

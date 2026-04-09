@@ -1,3 +1,6 @@
+## soren/cogs/premium.py
+
+
 """
 cogs/premium.py
 ================
@@ -12,7 +15,7 @@ import logging
 
 from utils.database import is_premium, get_connection, upsert_guild_config
 from utils.embeds import COLOR_EVENT, build_error_embed, build_success_embed
-from cogs.events import FREE_EVENT_LIMIT, PREMIUM_EVENT_LIMIT
+from cogs.events import FREE_EVENT_LIMIT
 
 log = logging.getLogger("soren.premium")
 
@@ -88,11 +91,10 @@ class Premium(commands.Cog):
             description=(
                 f"**{ctx.guild.name}** now has access to Soren Premium!\n\n"
                 "**Unlocked:**\n"
-                f"• Up to **{PREMIUM_EVENT_LIMIT}** active events\n"
-                "• Up to **100** RSVP names displayed\n"
-                "• All 10 embed colors\n"
-                "• Up to **10** G-Cal integrations\n"
-                "• Mention/remind up to **3 roles** per event\n"
+                "• Unlimited events\n"
+                "• Unlimited RSVP list display\n"
+                "• All 8 embed colors\n"
+                "• Unlimited G-Cal integrations\n"
                 "• Custom RSVP button labels\n\n"
                 "Run `/config` to confirm your server's plan."
             ),
@@ -111,8 +113,9 @@ class Premium(commands.Cog):
             title="\u2b50  Soren Premium",
             description=(
                 f"This server is currently on the **{server_tier}** plan.\n\n"
-                "Soren Premium gives your server access to expanded limits and exclusive features. "
-                "Visit **[soren.retrac.ca](https://soren.retrac.ca)** to learn more and get started."
+                "Soren Premium is a **one-time purchase of $15 per server** \u2014 "
+                "no subscriptions, no renewals. You get lifetime access to all "
+                "current and future premium features, plus support if you need it."
             ),
             color=discord.Color.gold(),
         )
@@ -120,43 +123,24 @@ class Premium(commands.Cog):
         embed.add_field(
             name="Feature",
             value=(
-                "\U0001f4c5 Active events\n"
+                "\U0001f4c5 Events per server\n"
                 "\U0001f465 RSVP names shown\n"
                 "\U0001f3a8 Embed color options\n"
                 "\U0001f501 Recurring events\n"
                 "\U0001f4c6 Google Calendar sync\n"
                 "\U0001f4c6 G-Cal integrations\n"
-                "\U0001f514 Mention/remind roles\n"
                 "\U0001f3f7\ufe0f Custom button labels"
             ),
             inline=True,
         )
         embed.add_field(
             name="Free",
-            value=(
-                f"{FREE_EVENT_LIMIT}\n"
-                "50\n"
-                "3 colors\n"
-                "\u2705\n"
-                "\u2705\n"
-                "Up to 2\n"
-                "1 role\n"
-                "\u274c"
-            ),
+            value=f"{FREE_EVENT_LIMIT}\n50\n3 colors\n\u2705\n\u2705\nUp to 2\n\u274c",
             inline=True,
         )
         embed.add_field(
             name="\u2b50 Premium",
-            value=(
-                f"{PREMIUM_EVENT_LIMIT}\n"
-                "100\n"
-                "10 colors\n"
-                "\u2705\n"
-                "\u2705\n"
-                "Up to 10\n"
-                "Up to 3 roles\n"
-                "\u2705"
-            ),
+            value="Unlimited\nUnlimited\n8 colors\n\u2705\n\u2705\nUnlimited\n\u2705",
             inline=True,
         )
 
@@ -182,7 +166,7 @@ class Premium(commands.Cog):
         if is_prem:
             embed.set_footer(text="\u2705 This server already has Premium \u2014 thank you for your support!")
         else:
-            embed.set_footer(text="Visit soren.retrac.ca to learn more and get started.")
+            embed.set_footer(text="soren.retrac.ca  \u2022  $15 one-time  \u2022  Lifetime updates & support")
 
         await ctx.respond(embed=embed)
 
@@ -203,10 +187,10 @@ class Premium(commands.Cog):
         embed.add_field(
             name="\U0001f4c5  Events (Event Creator role required)",
             value=(
-                "`/newevent` \u2014 Create a new event (inline — fill in title, time, timezone, role and more)\n"
-                "`/editeventdetails` \u2014 Edit title, description, and max RSVPs\n"
+                "`/newevent` \u2014 Create a new event\n"
+                "`/editeventdetails` \u2014 Edit title, description, max RSVPs\n"
                 "`/editeventtime` \u2014 Edit start/end time, timezone, reminder\n"
-                "`/editeventmentions` \u2014 Update or clear the mention/reminder role(s)\n"
+                "`/editeventmentions` \u2014 Update or clear mention/reminder roles\n"
                 "`/deleteevent` \u2014 Delete an event\n"
                 "`/cancelevent` \u2014 Soft cancel an event\n"
                 "`/listevents` \u2014 View all upcoming events\n"

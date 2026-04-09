@@ -1,3 +1,6 @@
+## soren/cogs/gcal_integrations.py
+
+
 """
 cogs/gcal_integrations.py
 ==========================
@@ -29,8 +32,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from math import ceil
 
-from utils.database import get_connection, get_guild_config, upsert_guild_config, is_premium
-from utils.embeds import get_guild_color
+from utils.database import get_connection, upsert_guild_config, is_premium
 
 log = logging.getLogger("soren.gcalint")
 
@@ -48,8 +50,8 @@ except ImportError:
 SCOPES     = ["https://www.googleapis.com/auth/calendar.readonly"]
 CREDS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 
-EVENTS_PER_PAGE    = 8
-FREE_GCAL_LIMIT    = 2
+EVENTS_PER_PAGE   = 8
+FREE_GCAL_LIMIT   = 2
 PREMIUM_GCAL_LIMIT = 10
 
 # Pending OAuth flows keyed by guild_id
@@ -136,18 +138,13 @@ async def _fetch_week_events(token_json: str, calendar_id: str) -> list[dict]:
 def _build_summary_embed(
     label: str,
     events: list[dict],
-    guild_id: int,
     page: int = 0,
     total_pages: int = 1,
 ) -> discord.Embed:
     """Build a summary embed for one page of calendar events."""
-    # ── FIX: look up the guild's custom embed color instead of hardcoding blurple ──
-    cfg   = get_guild_config(guild_id)
-    color = get_guild_color(cfg.get("embed_color") if cfg else None)
-
     embed = discord.Embed(
         title=f"📆  {label} — Weekly Summary",
-        color=color,
+        color=discord.Color.blurple(),
     )
 
     if not events:
@@ -174,12 +171,11 @@ def _build_summary_embed(
 class SummaryPaginatorView(discord.ui.View):
     """◀ / ▶ pagination for weekly summary embeds."""
 
-    def __init__(self, label: str, events: list[dict], total_pages: int, guild_id: int):
+    def __init__(self, label: str, events: list[dict], total_pages: int):
         super().__init__(timeout=300)
         self.label       = label
         self.events      = events
         self.total_pages = total_pages
-        self.guild_id    = guild_id  # FIX: store so paginated pages use correct color
         self.page        = 0
         self._update_buttons()
 
@@ -191,14 +187,14 @@ class SummaryPaginatorView(discord.ui.View):
     async def prev_btn(self, button: discord.ui.Button, interaction: discord.Interaction):
         self.page -= 1
         self._update_buttons()
-        embed = _build_summary_embed(self.label, self.events, self.guild_id, self.page, self.total_pages)
+        embed = _build_summary_embed(self.label, self.events, self.page, self.total_pages)
         await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, button: discord.ui.Button, interaction: discord.Interaction):
         self.page += 1
         self._update_buttons()
-        embed = _build_summary_embed(self.label, self.events, self.guild_id, self.page, self.total_pages)
+        embed = _build_summary_embed(self.label, self.events, self.page, self.total_pages)
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def on_timeout(self):
@@ -494,12 +490,10 @@ async def _post_summary(bot: discord.Bot, integration: dict):
 
     events      = await _fetch_week_events(token_json, cal_id)
     total_pages = ceil(len(events) / EVENTS_PER_PAGE) if events else 1
-    # FIX: pass guild_id so the embed uses the guild's custom color
-    embed       = _build_summary_embed(label, events, guild_id, page=0, total_pages=total_pages)
+    embed       = _build_summary_embed(label, events, page=0, total_pages=total_pages)
 
     if total_pages > 1:
-        # FIX: pass guild_id to paginator so subsequent pages also use the correct color
-        view = SummaryPaginatorView(label, events, total_pages, guild_id)
+        view = SummaryPaginatorView(label, events, total_pages)
         await channel.send(embed=embed, view=view)
     else:
         await channel.send(embed=embed)
@@ -548,28 +542,7 @@ class GcalIntegrations(commands.Cog):
                         description=(
                             f"Free servers can connect up to **{FREE_GCAL_LIMIT} calendars** "
                             f"({count}/{FREE_GCAL_LIMIT} used).\n\n"
-                            "Upgrade to **[Soren Premium](https://soren.retrac.ca)** for up to "
-                            f"{PREMIUM_GCAL_LIMIT} integrations."
-                        ),
-                        color=discord.Color.red(),
-                    ),
-                    ephemeral=True,
-                )
-                return
-        else:
-            with get_connection() as conn:
-                count = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM gcal_integrations WHERE guild_id=?",
-                    (guild_id,),
-                ).fetchone()["cnt"]
-            if count >= PREMIUM_GCAL_LIMIT:
-                await ctx.respond(
-                    embed=discord.Embed(
-                        title="❌  Calendar Limit Reached",
-                        description=(
-                            f"Premium servers can connect up to **{PREMIUM_GCAL_LIMIT} calendars** "
-                            f"({count}/{PREMIUM_GCAL_LIMIT} used).\n\n"
-                            "Please remove an existing integration to add a new one."
+                            "Upgrade to **[Soren Premium](https://soren.retrac.ca)** for unlimited integrations."
                         ),
                         color=discord.Color.red(),
                     ),

@@ -29,6 +29,8 @@ def init_db():
     """
     Create all tables if they don't already exist.
     Safe to call on every startup — uses CREATE TABLE IF NOT EXISTS.
+    New columns are added via ALTER TABLE migrations so existing databases
+    upgrade automatically without data loss.
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -82,6 +84,9 @@ def init_db():
     """)
 
     # ── Migrations: events table ──────────────────────────────────────────
+    # Each entry is (column_name, full SQLite column definition).
+    # ALTER TABLE ADD COLUMN is a no-op if the column already exists,
+    # but SQLite raises an error rather than silently skipping — hence try/except.
     for col, definition in [
         ("btn_accept_label",      "TEXT DEFAULT '✅ Accept'"),
         ("btn_tentative_label",   "TEXT DEFAULT '❓ Tentative'"),
@@ -90,16 +95,14 @@ def init_db():
         ("reminded_at",           "TEXT"),
         ("embed_color",           "TEXT DEFAULT '5865F2'"),
         ("max_rsvp",              "INTEGER DEFAULT 0"),
-        # Multi-role support — stores JSON array of role IDs e.g. "[123, 456, 789]"
-        # notify_role_id (singular) is kept for backward compatibility
-        ("notify_role_ids",       "TEXT"),
+        ("notify_role_ids",       "TEXT"),          # Multi-role JSON array
     ]:
         try:
             cursor.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
         except Exception:
-            pass
+            pass  # Column already exists — safe to ignore
 
-    # ── Migration: guild_config ───────────────────────────────────────────
+    # ── Migrations: guild_config ──────────────────────────────────────────
     try:
         cursor.execute("ALTER TABLE guild_config ADD COLUMN embed_color TEXT DEFAULT '5865F2'")
     except Exception:
@@ -153,7 +156,7 @@ def init_db():
         )
     """)
 
-    # ── Migration: gcal_integrations — add calendar_name column ──────────
+    # ── Migration: gcal_integrations ─────────────────────────────────────
     try:
         cursor.execute("ALTER TABLE gcal_integrations ADD COLUMN calendar_name TEXT")
     except Exception:
