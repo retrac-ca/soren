@@ -91,9 +91,9 @@ class Premium(commands.Cog):
             description=(
                 f"**{ctx.guild.name}** now has access to Soren Premium!\n\n"
                 "**Unlocked:**\n"
-                "• Unlimited events\n"
-                "• Unlimited RSVP list display\n"
-                "• All 8 embed colors\n"
+                "• Up to 50 active events\n"
+                "• Up to 100 RSVP names shown\n"
+                "• All 10 embed colors\n"
                 "• Unlimited G-Cal integrations\n"
                 "• Custom RSVP button labels\n\n"
                 "Run `/config` to confirm your server's plan."
@@ -113,7 +113,7 @@ class Premium(commands.Cog):
             title="\u2b50  Soren Premium",
             description=(
                 f"This server is currently on the **{server_tier}** plan.\n\n"
-                "Soren Premium is a **one-time purchase of $15 per server** \u2014 "
+                "Soren Premium is a **one-time purchase of $25 CAD per server** \u2014 "
                 "no subscriptions, no renewals. You get lifetime access to all "
                 "current and future premium features, plus support if you need it."
             ),
@@ -127,7 +127,6 @@ class Premium(commands.Cog):
                 "\U0001f465 RSVP names shown\n"
                 "\U0001f3a8 Embed color options\n"
                 "\U0001f501 Recurring events\n"
-                "\U0001f4c6 Google Calendar sync\n"
                 "\U0001f4c6 G-Cal integrations\n"
                 "\U0001f3f7\ufe0f Custom button labels"
             ),
@@ -135,12 +134,12 @@ class Premium(commands.Cog):
         )
         embed.add_field(
             name="Free",
-            value=f"{FREE_EVENT_LIMIT}\n50\n3 colors\n\u2705\n\u2705\nUp to 2\n\u274c",
+            value=f"{FREE_EVENT_LIMIT}\n50\n3 colors\n\u2705\nUp to 2\n\u274c",
             inline=True,
         )
         embed.add_field(
             name="\u2b50 Premium",
-            value="Unlimited\nUnlimited\n8 colors\n\u2705\n\u2705\nUnlimited\n\u2705",
+            value="50\n100\n10 colors\n\u2705\nUnlimited\n\u2705",
             inline=True,
         )
 
@@ -166,7 +165,7 @@ class Premium(commands.Cog):
         if is_prem:
             embed.set_footer(text="\u2705 This server already has Premium \u2014 thank you for your support!")
         else:
-            embed.set_footer(text="soren.retrac.ca  \u2022  $15 one-time  \u2022  Lifetime updates & support")
+            embed.set_footer(text="soren.retrac.ca  \u2022  $25 CAD one-time  \u2022  Lifetime updates & support")
 
         await ctx.respond(embed=embed)
 
@@ -197,15 +196,6 @@ class Premium(commands.Cog):
                 "`/myevents` \u2014 View events you've RSVPed to\n"
                 "`/eventbuttons` \u2014 Customize RSVP button labels\n"
                 "`/exportevents` \u2014 Export events as .ics calendar file"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="\U0001f4c6  Google Calendar (Admins)",
-            value=(
-                "`/gcal connect` \u2014 Link a Google Calendar\n"
-                "`/gcal verify` \u2014 Complete the connection\n"
-                "`/gcal disconnect` \u2014 Remove the Google Calendar link"
             ),
             inline=False,
         )

@@ -180,10 +180,24 @@ class Reminders(commands.Cog):
             log.warning(f"Reminder: channel {event['channel_id']} not found for event {event['id']}")
             return
 
-        embed      = build_reminder_embed(event)
-        ping_parts = []
+        # Use the guild's custom embed color for reminders
+        from utils.database import get_guild_config
+        from utils.embeds import get_guild_color
+        cfg        = get_guild_config(channel.guild.id)
+        guild_color = get_guild_color(cfg.get("embed_color") if cfg else None)
 
-        # ── Role pings — supports both new multi-role and legacy single-role ──
+        embed = discord.Embed(
+            title=f"⏰  Reminder: {event['title']} is starting soon!",
+            description=(
+                f"The event **{event['title']}** starts in "
+                f"**{event.get('reminder_offset', 15)} minutes**.\n\n"
+                "Check the original event post for details."
+            ),
+            color=guild_color,
+        )
+
+        # ── Role pings only — supports both new multi-role and legacy single-role ──
+        ping_parts = []
         role_ids = _parse_role_ids(event)
         for role_id in role_ids:
             role = channel.guild.get_role(role_id)
@@ -192,17 +206,8 @@ class Reminders(commands.Cog):
             else:
                 log.warning(f"Reminder: role {role_id} not found in guild {channel.guild.id}")
 
-        # ── Individual RSVP pings ─────────────────────────────────────────────
-        with get_connection() as conn:
-            rows = conn.execute(
-                "SELECT user_id FROM rsvps WHERE event_id=? AND status IN ('accepted','tentative')",
-                (event["id"],),
-            ).fetchall()
-
-        for row in rows:
-            member = channel.guild.get_member(row["user_id"])
-            if member:
-                ping_parts.append(member.mention)
+        # Note: individual RSVP pings deliberately removed — roles only at reminder time.
+        # Per-user pings will be a future premium feature.
 
         ping_str = " ".join(ping_parts) if ping_parts else ""
 

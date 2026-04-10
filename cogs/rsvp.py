@@ -15,7 +15,6 @@ RSVP buttons — available to everyone:
   A per-user cooldown prevents button spam.
 
 Free tier caps the displayed RSVP list at 50 names per status column.
-Premium tier caps at 100 names per status column.
 """
 
 import discord
@@ -28,9 +27,8 @@ import logging
 
 log = logging.getLogger("soren.rsvp")
 
-# ── RSVP display caps ─────────────────────────────────────────────────────────
-FREE_RSVP_DISPLAY_LIMIT    = 50
-PREMIUM_RSVP_DISPLAY_LIMIT = 100
+# ── Free tier display cap ─────────────────────────────────────────────────────
+FREE_RSVP_DISPLAY_LIMIT = 50
 
 # ── Button label defaults ─────────────────────────────────────────────────────
 DEFAULT_ACCEPT_LABEL    = "✅ Accept"
@@ -54,9 +52,7 @@ def fetch_event(event_id: int) -> dict | None:
 def fetch_rsvps_for_embed(event_id: int, guild: discord.Guild, premium: bool) -> dict:
     """
     Build the rsvps dict expected by build_event_embed().
-    Resolves user IDs to display names and applies the tier display cap.
-    Free:    50 names shown per status column.
-    Premium: 100 names shown per status column.
+    Resolves user IDs to display names and applies the free-tier cap.
     """
     with get_connection() as conn:
         rows = conn.execute(
@@ -67,27 +63,24 @@ def fetch_rsvps_for_embed(event_id: int, guild: discord.Guild, premium: bool) ->
     result = {"accepted": [], "declined": [], "tentative": []}
     counts = {"accepted": 0, "declined": 0, "tentative": 0}
 
-    limit = PREMIUM_RSVP_DISPLAY_LIMIT if premium else FREE_RSVP_DISPLAY_LIMIT
-
     for row in rows:
         status  = row["status"]
         user_id = row["user_id"]
         counts[status] += 1
 
-        if len(result[status]) >= limit:
+        limit = None if premium else FREE_RSVP_DISPLAY_LIMIT
+        if limit and len(result[status]) >= limit:
             continue
 
         member = guild.get_member(user_id)
         name   = member.display_name if member else f"<User {user_id}>"
         result[status].append(name)
 
-    for status in result:
-        overflow = counts[status] - len(result[status])
-        if overflow > 0:
-            if premium:
-                result[status].append(f"*(+{overflow} more)*")
-            else:
-                result[status].append(f"*(+{overflow} more — upgrade to Premium to see more)*")
+    if not premium:
+        for status in result:
+            overflow = counts[status] - len(result[status])
+            if overflow > 0:
+                result[status].append(f"*(+{overflow} more — upgrade to Premium to see all)*")
 
     return result
 
@@ -98,6 +91,7 @@ async def _promote_from_waitlist(event_id: int, guild: discord.Guild, bot: disco
     the next person in line that a spot has opened up.
     """
     with get_connection() as conn:
+        # Check if table exists first (graceful degradation)
         try:
             next_entry = conn.execute(
                 "SELECT * FROM waitlist WHERE event_id=? ORDER BY id ASC LIMIT 1",
@@ -186,6 +180,7 @@ class EventView(discord.ui.View):
             decline_label   = event.get("btn_decline_label")   or DEFAULT_DECLINE_LABEL
             show_tentative  = bool(event.get("btn_tentative_enabled", 1))
 
+        # ── Accept button ─────────────────────────────────────────────────
         accept_btn = discord.ui.Button(
             label=accept_label,
             style=discord.ButtonStyle.success,
@@ -194,6 +189,7 @@ class EventView(discord.ui.View):
         accept_btn.callback = self._make_rsvp_callback("accepted")
         self.add_item(accept_btn)
 
+        # ── Tentative button (optional) ───────────────────────────────────
         if show_tentative:
             tentative_btn = discord.ui.Button(
                 label=tentative_label,
@@ -203,6 +199,7 @@ class EventView(discord.ui.View):
             tentative_btn.callback = self._make_rsvp_callback("tentative")
             self.add_item(tentative_btn)
 
+        # ── Decline button ────────────────────────────────────────────────
         decline_btn = discord.ui.Button(
             label=decline_label,
             style=discord.ButtonStyle.danger,
@@ -214,8 +211,9 @@ class EventView(discord.ui.View):
     def _make_rsvp_callback(self, status: str):
         """Returns an async callback bound to the given RSVP status."""
         async def callback(interaction: discord.Interaction):
+            # ── Cooldown check ────────────────────────────────────────────
             cooldown_key = (interaction.user.id, self.event_id)
-            now  = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
             last = _rsvp_cooldowns.get(cooldown_key)
             if last and (now - last).total_seconds() < RSVP_COOLDOWN_SECONDS:
                 await interaction.response.send_message(
@@ -230,6 +228,7 @@ class EventView(discord.ui.View):
                 await interaction.response.send_message("This event no longer exists.", ephemeral=True)
                 return
 
+            # ── Max RSVP / waitlist check ─────────────────────────────────
             if status == "accepted" and event.get("max_rsvp", 0) > 0:
                 with get_connection() as conn:
                     count = conn.execute(
@@ -245,15 +244,37 @@ class EventView(discord.ui.View):
                     )
                     return
 
+            # ── Check previous RSVP status ────────────────────────────────
             was_accepted = False
+            already_this_status = False
             with get_connection() as conn:
                 prev = conn.execute(
                     "SELECT status FROM rsvps WHERE event_id=? AND user_id=?",
                     (self.event_id, interaction.user.id),
                 ).fetchone()
-                if prev and prev["status"] == "accepted" and status != "accepted":
-                    was_accepted = True
+                if prev:
+                    if prev["status"] == status:
+                        already_this_status = True
+                    elif prev["status"] == "accepted" and status != "accepted":
+                        was_accepted = True
 
+            # ── Toggle off if same button clicked again ────────────────────
+            if already_this_status:
+                with get_connection() as conn:
+                    conn.execute(
+                        "DELETE FROM rsvps WHERE event_id=? AND user_id=?",
+                        (self.event_id, interaction.user.id),
+                    )
+                    conn.commit()
+                log.info(f"RSVP: {interaction.user} removed RSVP from event {self.event_id}")
+                await interaction.response.send_message(
+                    f"Your RSVP for **{event['title']}** has been removed.",
+                    ephemeral=True,
+                )
+                await refresh_event_embed(self.event_id, interaction.guild, interaction.client)
+                return
+
+            # ── Upsert RSVP ───────────────────────────────────────────────
             with get_connection() as conn:
                 conn.execute(
                     """
@@ -280,6 +301,7 @@ class EventView(discord.ui.View):
 
             await refresh_event_embed(self.event_id, interaction.guild, interaction.client)
 
+            # ── Waitlist promotion ────────────────────────────────────────
             if was_accepted:
                 await _promote_from_waitlist(self.event_id, interaction.guild, interaction.client)
 

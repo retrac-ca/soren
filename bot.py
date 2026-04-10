@@ -96,7 +96,6 @@ COGS = [
     "cogs.events",
     "cogs.rsvp",
     "cogs.reminders",
-    "cogs.google_cal",
     "cogs.gcal_integrations",
     "cogs.premium",
     "cogs.ping",
