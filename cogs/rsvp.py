@@ -272,6 +272,14 @@ class EventView(discord.ui.View):
                     ephemeral=True,
                 )
                 await refresh_event_embed(self.event_id, interaction.guild, interaction.client)
+
+                # ── Modlog: RSVP removed ──────────────────────────────────
+                try:
+                    from cogs.modlogs import log_event, embed_rsvp
+                    ml_embed = embed_rsvp(event["title"], self.event_id, interaction.user, "removed")
+                    await log_event(interaction.client, interaction.guild_id, ml_embed)
+                except Exception:
+                    pass
                 return
 
             # ── Upsert RSVP ───────────────────────────────────────────────
@@ -300,6 +308,14 @@ class EventView(discord.ui.View):
             )
 
             await refresh_event_embed(self.event_id, interaction.guild, interaction.client)
+
+            # ── Modlog: RSVP update ───────────────────────────────────────
+            try:
+                from cogs.modlogs import log_event, embed_rsvp
+                ml_embed = embed_rsvp(event["title"], self.event_id, interaction.user, status)
+                await log_event(interaction.client, interaction.guild_id, ml_embed)
+            except Exception as e:
+                pass  # Non-critical — don't log modlog failures for every RSVP click
 
             # ── Waitlist promotion ────────────────────────────────────────
             if was_accepted:

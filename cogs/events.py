@@ -245,10 +245,37 @@ def compute_next_start(start_iso: str, recur_rule: str, recur_interval: int) -> 
 
 
 async def post_event_embed(channel: discord.TextChannel, event_data: dict):
-    """Build and post the event embed. Saves message_id back to DB."""
+    """Build and post the event embed. Sends role ping then embed. Saves message_id back to DB."""
+    import json as _json
     from cogs.rsvp import EventView
+
     cfg = get_guild_config(channel.guild.id)
     event_data = {**event_data, "embed_color": cfg.get("embed_color") if cfg else None}
+
+    # ── Role ping — fires before the embed so it appears above it ────────
+    ping_parts = []
+    raw = event_data.get("notify_role_ids")
+    if raw:
+        try:
+            ids = _json.loads(raw)
+            for rid in ids:
+                role = channel.guild.get_role(int(rid))
+                if role:
+                    ping_parts.append(role.mention)
+        except Exception:
+            pass
+    # Legacy single-role fallback
+    if not ping_parts and event_data.get("notify_role_id"):
+        role = channel.guild.get_role(int(event_data["notify_role_id"]))
+        if role:
+            ping_parts.append(role.mention)
+
+    if ping_parts:
+        try:
+            await channel.send(" ".join(ping_parts))
+        except discord.Forbidden:
+            log.warning(f"post_event_embed: no permission to send role ping in channel {channel.id}")
+
     rsvps = {"accepted": [], "declined": [], "tentative": []}
     embed = build_event_embed(event_data, rsvps)
     view  = EventView(event_id=event_data["id"], event=event_data)
@@ -256,6 +283,16 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict):
     with get_connection() as conn:
         conn.execute("UPDATE events SET message_id = ? WHERE id = ?", (msg.id, event_data["id"]))
         conn.commit()
+
+    # ── Modlog: event created ─────────────────────────────────────────────
+    try:
+        from cogs.modlogs import log_event, embed_event_created
+        creator = channel.guild.get_member(event_data.get("creator_id", 0))
+        if creator:
+            ml_embed = embed_event_created(event_data, creator)
+            await log_event(channel.guild._state._get_client(), channel.guild.id, ml_embed)
+    except Exception as e:
+        log.warning(f"modlog hook failed (event created): {e}")
 
 
 async def repost_recurring_embed(bot: discord.Bot, event_id: int):
@@ -387,6 +424,18 @@ class EditEventDetailsModal(discord.ui.Modal):
         )
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
 
+        # ── Modlog: event edited ──────────────────────────────────────────
+        try:
+            from cogs.modlogs import log_event, embed_event_edited
+            ml_embed = embed_event_edited(
+                {**self.event, "title": title},
+                interaction.user,
+                "Title, description, max RSVPs, or notify role",
+            )
+            await log_event(interaction.client, interaction.guild_id, ml_embed)
+        except Exception as e:
+            log.warning(f"modlog hook failed (editeventdetails): {e}")
+
 
 # ── Edit Event Time Modal ─────────────────────────────────────────────────────
 
@@ -488,6 +537,18 @@ class EditEventTimeModal(discord.ui.Modal):
             ephemeral=True,
         )
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
+
+        # ── Modlog: event edited ──────────────────────────────────────────
+        try:
+            from cogs.modlogs import log_event, embed_event_edited
+            ml_embed = embed_event_edited(
+                self.event,
+                interaction.user,
+                "Start time, end time, timezone, or reminder offset",
+            )
+            await log_event(interaction.client, interaction.guild_id, ml_embed)
+        except Exception as e:
+            log.warning(f"modlog hook failed (editeventtime): {e}")
 
 
 # ── Event Buttons Modal ───────────────────────────────────────────────────────
@@ -609,6 +670,14 @@ class DeleteConfirmView(discord.ui.View):
         with get_connection() as conn:
             conn.execute("DELETE FROM events WHERE id=?", (event["id"],))
             conn.commit()
+
+        # ── Modlog: event deleted ─────────────────────────────────────────
+        try:
+            from cogs.modlogs import log_event, embed_event_deleted
+            ml_embed = embed_event_deleted(event, interaction.user)
+            await log_event(interaction.client, interaction.guild_id, ml_embed)
+        except Exception as e:
+            log.warning(f"modlog hook failed (event deleted): {e}")
 
         await interaction.response.edit_message(
             embed=build_success_embed(f"Event **{event['title']}** (ID: `{event['id']}`) has been deleted."),
@@ -829,6 +898,18 @@ class EditEventMentionsModal(discord.ui.Modal):
             ephemeral=True,
         )
         await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
+
+        # ── Modlog: event edited ──────────────────────────────────────────
+        try:
+            from cogs.modlogs import log_event, embed_event_edited
+            ml_embed = embed_event_edited(
+                self.event,
+                interaction.user,
+                "Mention/reminder roles",
+            )
+            await log_event(interaction.client, interaction.guild_id, ml_embed)
+        except Exception as e:
+            log.warning(f"modlog hook failed (editeventmentions): {e}")
 
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
@@ -1226,6 +1307,15 @@ class Events(commands.Cog):
         await ctx.respond(embed=build_success_embed(f"Event **{event['title']}** (ID: `{event_id}`) marked as cancelled."), ephemeral=True)
         from cogs.rsvp import refresh_event_embed
         await refresh_event_embed(event_id, ctx.guild, ctx.bot)
+
+        # ── Modlog: event cancelled ───────────────────────────────────────
+        try:
+            from cogs.modlogs import log_event, embed_event_cancelled
+            cancelled_event = {**event, "title": cancelled_title}
+            ml_embed = embed_event_cancelled(cancelled_event, ctx.author)
+            await log_event(ctx.bot, ctx.guild.id, ml_embed)
+        except Exception as e:
+            log.warning(f"modlog hook failed (event cancelled): {e}")
 
     # ── /myevents ─────────────────────────────────────────────────────────
     @discord.slash_command(name="myevents", description="List events you've RSVPed to in this server.")

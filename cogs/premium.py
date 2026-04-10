@@ -86,6 +86,14 @@ class Premium(commands.Cog):
         upsert_guild_config(ctx.guild.id, is_premium=1)
         log.info(f"Premium code redeemed in guild {ctx.guild.id} ({ctx.guild.name}) by {ctx.author}")
 
+        # ── Modlog: premium redeemed ──────────────────────────────────────
+        try:
+            from cogs.modlogs import log_event, embed_premium_redeemed
+            ml_embed = embed_premium_redeemed(ctx.author, code)
+            await log_event(ctx.bot, ctx.guild.id, ml_embed)
+        except Exception as e:
+            log.warning(f"modlog hook failed (premium redeemed): {e}")
+
         embed = discord.Embed(
             title="\u2b50  Premium Activated!",
             description=(

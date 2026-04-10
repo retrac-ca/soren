@@ -99,7 +99,7 @@ COGS = [
     "cogs.gcal_integrations",
     "cogs.premium",
     "cogs.ping",
-    "cogs.logs",
+    "cogs.modlogs",
 ]
 
 
