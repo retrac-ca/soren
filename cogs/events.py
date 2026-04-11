@@ -189,7 +189,11 @@ async def autocomplete_reminder(ctx: discord.AutocompleteContext):
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
 def build_listevents_embed(rows, guild):
-    embed = discord.Embed(title="📅  Upcoming Events", color=COLOR_EVENT)
+    from utils.database import get_guild_config
+    from utils.embeds import get_guild_color
+    cfg   = get_guild_config(guild.id)
+    color = get_guild_color(cfg.get("embed_color") if cfg else None)
+    embed = discord.Embed(title="📅  Upcoming Events", color=color)
     for row in rows:
         try:
             tz = pytz.timezone(row["timezone"] or "UTC")
@@ -209,13 +213,12 @@ def build_listevents_embed(rows, guild):
 
 
 def get_guild_event_count(guild_id: int) -> int:
-    """Count only upcoming events for tier cap purposes.
-    Past events don't count against the limit — servers shouldn't be
-    penalised for having run many events historically."""
+    """Count only upcoming non-cancelled events for tier cap purposes.
+    Past events and cancelled events don't count against the limit."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM events WHERE guild_id = ? AND start_time >= ?",
+            "SELECT COUNT(*) as cnt FROM events WHERE guild_id = ? AND start_time >= ? AND title NOT LIKE '[CANCELLED]%'",
             (guild_id, now_iso),
         ).fetchone()
     return row["cnt"] if row else 0
@@ -244,7 +247,7 @@ def compute_next_start(start_iso: str, recur_rule: str, recur_interval: int) -> 
     return next_dt.isoformat()
 
 
-async def post_event_embed(channel: discord.TextChannel, event_data: dict):
+async def post_event_embed(channel: discord.TextChannel, event_data: dict, bot: discord.Bot | None = None):
     """Build and post the event embed. Sends role ping then embed. Saves message_id back to DB."""
     import json as _json
     from cogs.rsvp import EventView
@@ -288,9 +291,10 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict):
     try:
         from cogs.modlogs import log_event, embed_event_created
         creator = channel.guild.get_member(event_data.get("creator_id", 0))
-        if creator:
+        _bot = bot or channel._state._get_client()
+        if creator and _bot:
             ml_embed = embed_event_created(event_data, creator)
-            await log_event(channel.guild._state._get_client(), channel.guild.id, ml_embed)
+            await log_event(_bot, channel.guild.id, ml_embed)
     except Exception as e:
         log.warning(f"modlog hook failed (event created): {e}")
 
@@ -828,9 +832,9 @@ class EditEventMentionsModal(discord.ui.Modal):
                 current_roles = role.name
 
         if premium:
-            placeholder = "Role name(s), comma-separated — up to 3. Leave blank to clear."
+            placeholder = "Role name(s), comma-separated — up to 3. Type 'clear' or 'none' to remove all roles."
         else:
-            placeholder = "Role name or ID. Leave blank to clear."
+            placeholder = "Role name or ID. Type 'clear' or 'none' to remove the role."
 
         self.add_item(discord.ui.InputText(
             label="Notify Role(s)" if premium else "Notify Role",
@@ -848,8 +852,10 @@ class EditEventMentionsModal(discord.ui.Modal):
 
         raw_input = self.children[0].value.strip()
 
+        # Treat 'clear', 'none', or '-' as explicit clear signals
+        is_clear_keyword = raw_input.lower() in ("clear", "none", "-", "")
         role_ids = []
-        if raw_input:
+        if raw_input and not is_clear_keyword:
             # Split by comma, resolve each entry to a role
             parts = [p.strip() for p in raw_input.split(",") if p.strip()]
             # Free servers only get the first role
@@ -1149,7 +1155,7 @@ class Events(commands.Cog):
             "btn_tentative_enabled": 1,
         }
 
-        await post_event_embed(channel, event)
+        await post_event_embed(channel, event, bot=ctx.bot)
 
         # ── Success message ───────────────────────────────────────────────
         recur_str = RECUR_LABELS.get(recur_rule, recur_rule)
@@ -1327,6 +1333,7 @@ class Events(commands.Cog):
                 SELECT e.id, e.title, e.start_time, e.timezone, e.channel_id, r.status
                 FROM rsvps r JOIN events e ON r.event_id = e.id
                 WHERE r.user_id=? AND e.guild_id=? AND e.start_time >= ? AND r.status IN ('accepted','tentative')
+                AND e.title NOT LIKE '[CANCELLED]%'
                 ORDER BY e.start_time ASC
                 """,
                 (ctx.author.id, ctx.guild.id, now_iso),

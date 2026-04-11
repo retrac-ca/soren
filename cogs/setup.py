@@ -7,7 +7,7 @@ Commands
 --------
 /setup        — Assign Event Creator role (admin only); warns if already configured
 /config       — View current server settings
-/embedcolor   — Choose the event embed color (free: 3 options, premium: 8)
+/embedcolor   — Choose the event embed color (free: 3 options, premium: 10)
 """
 
 import discord
@@ -36,6 +36,8 @@ PREMIUM_COLOR_OPTIONS = FREE_COLOR_OPTIONS + [
     discord.SelectOption(label="Cyan",   value="1ABC9C", emoji="🩵"),
     discord.SelectOption(label="Orange", value="E67E22", emoji="🟠"),
     discord.SelectOption(label="Brown",  value="98653C", emoji="🟤"),
+    discord.SelectOption(label="Pink",   value="E91E8C", emoji="🩷"),
+    discord.SelectOption(label="Olive",  value="808000", emoji="🫒"),
 ]
 
 
@@ -247,16 +249,19 @@ class Setup(commands.Cog):
         embed.add_field(name="Embed Color",        value=color_name, inline=True)
         embed.add_field(
             name="Event Limit",
-            value="Unlimited" if cfg.get("is_premium") else str(FREE_EVENT_LIMIT),
+            value="50" if cfg.get("is_premium") else str(FREE_EVENT_LIMIT),
             inline=True,
         )
         embed.add_field(
-            name="RSVP Limit per Event",
-            value="Unlimited" if cfg.get("is_premium") else "50",
+            name="RSVP Display Limit",
+            value="100" if cfg.get("is_premium") else "50",
             inline=True,
         )
-        gcal = "✅ Connected" if cfg.get("gcal_id") else "❌ Not connected"
-        embed.add_field(name="Google Calendar", value=gcal, inline=False)
+        embed.add_field(
+            name="G-Cal Integrations",
+            value="Up to 10" if cfg.get("is_premium") else "Up to 2",
+            inline=True,
+        )
 
         await ctx.respond(embed=embed, ephemeral=True)
 

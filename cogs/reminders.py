@@ -116,9 +116,16 @@ class Reminders(commands.Cog):
                 "SELECT * FROM events WHERE reminded_at IS NULL"
             ).fetchall()
 
+        log.info(f"Reminder loop tick: {len(events)} unreminded event(s) found, now_utc={now_utc.isoformat()}")
+
         for row in events:
             event    = dict(row)
             event_id = event["id"]
+
+            # Skip cancelled events — they should never send reminders
+            if event.get("title", "").startswith("[CANCELLED]"):
+                log.debug(f"Reminder: skipping cancelled event {event_id} '{event['title']}'")
+                continue
 
             try:
                 start_dt = datetime.fromisoformat(event["start_time"])
@@ -126,19 +133,30 @@ class Reminders(commands.Cog):
                     start_dt = start_dt.replace(tzinfo=timezone.utc)
                 else:
                     start_dt = start_dt.astimezone(timezone.utc)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                log.warning(f"Reminder: could not parse start_time for event {event_id}: {event['start_time']!r} — {e}")
                 continue
 
             # Quick skip: event is more than 2 hours away — not our concern yet
             if start_dt > now_plus_2h:
+                log.debug(f"Reminder: skipping event {event_id} '{event['title']}' — starts in >{2}h (start_utc={start_dt.isoformat()})")
                 continue
 
             offset_minutes = event.get("reminder_offset") or 15
             remind_at      = start_dt - timedelta(minutes=offset_minutes)
+            diff           = (now_utc - remind_at).total_seconds()
 
-            diff = (now_utc - remind_at).total_seconds()
+            log.info(
+                f"Reminder check: event {event_id} '{event['title']}' | "
+                f"start_utc={start_dt.isoformat()} | "
+                f"remind_at={remind_at.isoformat()} | "
+                f"diff={diff:.0f}s | "
+                f"window=(-60, 300)"
+            )
+
             # Window: fire if we're between 60s early and 300s late
             if not (-60 <= diff <= 300):
+                log.info(f"Reminder: event {event_id} outside fire window (diff={diff:.0f}s) — skipping")
                 continue
 
             # Mark as reminded immediately to prevent double-sends
