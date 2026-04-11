@@ -326,9 +326,32 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
         except (discord.NotFound, discord.Forbidden):
             pass
 
-    # Post a fresh embed
-    cfg = get_guild_config(guild.id)
+    # Post a fresh embed — ping roles first so the mention appears above the embed
+    cfg   = get_guild_config(guild.id)
     event = {**event, "embed_color": cfg.get("embed_color") if cfg else None}
+
+    # ── Role ping ─────────────────────────────────────────────────────────
+    import json as _json
+    ping_parts = []
+    raw = event.get("notify_role_ids")
+    if raw:
+        try:
+            for rid in _json.loads(raw):
+                role = channel.guild.get_role(int(rid))
+                if role:
+                    ping_parts.append(role.mention)
+        except Exception:
+            pass
+    if not ping_parts and event.get("notify_role_id"):
+        role = channel.guild.get_role(int(event["notify_role_id"]))
+        if role:
+            ping_parts.append(role.mention)
+    if ping_parts:
+        try:
+            await channel.send(" ".join(ping_parts))
+        except discord.Forbidden:
+            pass
+
     rsvps = {"accepted": [], "declined": [], "tentative": []}
     embed = build_event_embed(event, rsvps)
     view  = EventView(event_id=event_id, event=event)
