@@ -155,6 +155,27 @@ def init_db():
     except Exception:
         pass
 
+    # ── Migration: gcal_integrations — add reminder columns ──────────────
+    for col, definition in [
+        ("reminders_enabled", "INTEGER DEFAULT 1"),
+        ("reminder_offset",   "INTEGER DEFAULT 15"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE gcal_integrations ADD COLUMN {col} {definition}")
+        except Exception:
+            pass
+
+    # ── GCal integration reminders — tracks which events have been reminded ──
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gcal_reminders (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            integration_id   INTEGER NOT NULL,
+            gcal_event_id    TEXT    NOT NULL,
+            fired_at         TEXT    DEFAULT (datetime('now')),
+            UNIQUE(integration_id, gcal_event_id)
+        )
+    """)
+
     # ── Redeemed premium codes ────────────────────────────────────────────
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS redeemed_codes (

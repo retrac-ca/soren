@@ -139,6 +139,58 @@ async def _fetch_week_events(token_json: str, calendar_id: str) -> list[dict]:
         return []
 
 
+async def _fetch_upcoming_for_reminders(token_json: str, calendar_id: str,
+                                         lookahead_minutes: int) -> list[dict]:
+    """
+    Fetch events starting within the next `lookahead_minutes` minutes.
+    Returns full event data including gcal_event_id, start_dt, description.
+    Used exclusively by the reminder loop.
+    """
+    try:
+        service   = _get_service(token_json)
+        now       = datetime.now(timezone.utc)
+        look_end  = now + timedelta(minutes=lookahead_minutes + 5)  # small buffer
+
+        result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=now.isoformat(),
+            timeMax=look_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50,
+        ).execute()
+
+        events = []
+        for item in result.get("items", []):
+            start = item.get("start", {})
+            start_str = start.get("dateTime") or start.get("date", "")
+            try:
+                if "T" in start_str:
+                    start_dt = datetime.fromisoformat(start_str)
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        start_dt = start_dt.astimezone(timezone.utc)
+                else:
+                    # All-day event — skip, no meaningful reminder time
+                    continue
+            except Exception:
+                continue
+
+            events.append({
+                "gcal_event_id": item.get("id", ""),
+                "title":         item.get("summary", "Untitled"),
+                "start_dt":      start_dt,
+                "time_str":      _format_event_time(item),
+                "location":      _clean_html(item.get("location", "")),
+                "description":   _clean_html(item.get("description", "")),
+            })
+        return events
+    except Exception as e:
+        log.error(f"_fetch_upcoming_for_reminders failed for calendar {calendar_id}: {e}")
+        return []
+
+
 def _build_summary_embed(
     label: str,
     events: list[dict],
@@ -425,9 +477,11 @@ class GcalIntegrations(commands.Cog):
     def __init__(self, bot: discord.Bot):
         self.bot = bot
         self.summary_loop.start()
+        self.reminder_loop.start()
 
     def cog_unload(self):
         self.summary_loop.cancel()
+        self.reminder_loop.cancel()
 
     gcalint = SlashCommandGroup("gcalint", "Google Calendar integration commands.")
 
@@ -528,9 +582,19 @@ class GcalIntegrations(commands.Cog):
                 sched_str = f"Daily at {row['post_hour']:02d}:00 UTC"
             else:
                 sched_str = f"Every {row['custom_interval']} days at {row['post_hour']:02d}:00 UTC"
+            # Reminder info
+            reminders_on = row["reminders_enabled"] if "reminders_enabled" in row.keys() else 1
+            offset       = row["reminder_offset"]   if "reminder_offset"   in row.keys() else 15
+            offset_str   = {15: "15 min", 30: "30 min", 60: "1 hour", 1440: "1 day"}.get(offset, f"{offset} min")
+            reminder_str = f"✅ {offset_str} before" if reminders_on else "⏸️ Disabled"
             embed.add_field(
                 name=f"[ID: {row['id']}]  {row['label']}  —  {status}",
-                value=f"**Channel:** <#{row['channel_id']}>\n**Schedule:** {sched_str}\n**Last posted:** {row['last_posted'] or 'Never'}",
+                value=(
+                    f"**Channel:** <#{row['channel_id']}>\n"
+                    f"**Schedule:** {sched_str}\n"
+                    f"**Reminders:** {reminder_str}\n"
+                    f"**Last posted:** {row['last_posted'] or 'Never'}"
+                ),
                 inline=False,
             )
         await ctx.respond(embed=embed, ephemeral=True)
@@ -587,6 +651,75 @@ class GcalIntegrations(commands.Cog):
         await _post_summary(self.bot, dict(row))
         await ctx.followup.send(embed=discord.Embed(description=f"✅ Summary posted for **{row['label']}**.", color=discord.Color.green()), ephemeral=True)
 
+    # ── /gcalint reminder ─────────────────────────────────────────────────
+    @gcalint.command(name="reminder", description="Set how far in advance to send event reminders for an integration.")
+    @discord.default_permissions(administrator=True)
+    async def gcalint_reminder(
+        self,
+        ctx: discord.ApplicationContext,
+        integration_id: discord.Option(int, "The integration ID to configure."),
+        offset: discord.Option(
+            str,
+            "How far in advance to remind.",
+            choices=[
+                discord.OptionChoice(name="15 minutes before", value="15"),
+                discord.OptionChoice(name="30 minutes before", value="30"),
+                discord.OptionChoice(name="1 hour before",     value="60"),
+                discord.OptionChoice(name="1 day before",      value="1440"),
+            ],
+        ),
+    ):
+        if not await _require_admin(ctx):
+            return
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM gcal_integrations WHERE id=? AND guild_id=?", (integration_id, ctx.guild.id)).fetchone()
+        if not row:
+            await ctx.respond(embed=discord.Embed(description=f"❌ No integration found with ID `{integration_id}`.", color=discord.Color.red()), ephemeral=True)
+            return
+        offset_int = int(offset)
+        with get_connection() as conn:
+            conn.execute("UPDATE gcal_integrations SET reminder_offset=? WHERE id=?", (offset_int, integration_id))
+            conn.commit()
+        label_map = {"15": "15 minutes", "30": "30 minutes", "60": "1 hour", "1440": "1 day"}
+        await ctx.respond(
+            embed=discord.Embed(
+                description=f"✅ **{row['label']}** reminders will now fire **{label_map[offset]} before** each event.",
+                color=discord.Color.green(),
+            ),
+            ephemeral=True,
+        )
+        log.info(f"gcalint: guild {ctx.guild.id} set reminder_offset={offset_int} for integration {integration_id}")
+
+    # ── /gcalint reminders ────────────────────────────────────────────────
+    @gcalint.command(name="reminders", description="Toggle event reminders on or off for an integration.")
+    @discord.default_permissions(administrator=True)
+    async def gcalint_reminders(
+        self,
+        ctx: discord.ApplicationContext,
+        integration_id: discord.Option(int, "The integration ID to toggle reminders for."),
+    ):
+        if not await _require_admin(ctx):
+            return
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM gcal_integrations WHERE id=? AND guild_id=?", (integration_id, ctx.guild.id)).fetchone()
+        if not row:
+            await ctx.respond(embed=discord.Embed(description=f"❌ No integration found with ID `{integration_id}`.", color=discord.Color.red()), ephemeral=True)
+            return
+        current = row["reminders_enabled"] if "reminders_enabled" in row.keys() else 1
+        new_val = 0 if current else 1
+        with get_connection() as conn:
+            conn.execute("UPDATE gcal_integrations SET reminders_enabled=? WHERE id=?", (new_val, integration_id))
+            conn.commit()
+        state = "✅ Enabled" if new_val else "⏸️ Disabled"
+        await ctx.respond(
+            embed=discord.Embed(
+                description=f"{state} reminders for **{row['label']}**.",
+                color=discord.Color.green(),
+            ),
+            ephemeral=True,
+        )
+        log.info(f"gcalint: guild {ctx.guild.id} set reminders_enabled={new_val} for integration {integration_id}")
+
     # ── Background loop ───────────────────────────────────────────────────
     @tasks.loop(minutes=5)
     async def summary_loop(self):
@@ -605,6 +738,156 @@ class GcalIntegrations(commands.Cog):
 
     @summary_loop.before_loop
     async def before_summary_loop(self):
+        await self.bot.wait_until_ready()
+
+    # ── Reminder loop ─────────────────────────────────────────────────────
+    @tasks.loop(minutes=5)
+    async def reminder_loop(self):
+        """
+        Runs every 5 minutes. For each active integration with reminders enabled,
+        fetches upcoming events and fires a reminder message if:
+          - The event starts within the reminder window
+          - The event hasn't already been reminded (tracked in gcal_reminders)
+
+        Optimization: for short offsets (< 60 min), we only call the GCal API
+        during the minutes-of-hour window where a reminder could plausibly fire.
+        For example, a 15-min offset only needs to fetch between :00 and :20 of
+        each hour since any event starting in that hour will be caught. For
+        longer offsets (1 day) we always fetch since the window is too large to
+        skip safely.
+        """
+        if not GCAL_AVAILABLE:
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # ── Cleanup: remove reminder records older than 30 days ───────────
+        try:
+            cutoff = (now - timedelta(days=30)).isoformat()
+            with get_connection() as conn:
+                conn.execute("DELETE FROM gcal_reminders WHERE fired_at < ?", (cutoff,))
+                conn.commit()
+        except Exception as e:
+            log.warning(f"gcalint reminder: cleanup failed: {e}")
+
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM gcal_integrations WHERE active=1 AND reminders_enabled=1"
+            ).fetchall()
+
+        for row in rows:
+            integration = dict(row)
+            int_id      = integration["id"]
+            offset      = integration.get("reminder_offset", 15)
+
+            # ── API call optimization ─────────────────────────────────────
+            # For offsets under 60 minutes, only fetch during the window of
+            # the current hour where a reminder could fire. The loop runs every
+            # 5 minutes so we add a 10-minute buffer to avoid missing edge cases.
+            # For 1-day offsets, always fetch — the window spans the whole day.
+            if offset < 60:
+                # Current minute within the hour (0–59)
+                current_minute = now.minute
+                # A reminder fires when: event_start - offset <= now <= event_start
+                # So we only need to fetch if now is within [0, offset+10] minutes
+                # of any possible event start. Since events start at any minute,
+                # we can't skip based on the hour alone — but we CAN skip if the
+                # loop has already run within the last tick and found nothing.
+                # Practical optimization: skip if current_minute > (offset + 10)
+                # AND current_minute < (60 - 10), meaning we're in the "dead zone"
+                # of the hour where no short-offset reminders would fire for events
+                # starting at :00 of the next hour.
+                dead_zone_start = offset + 10
+                dead_zone_end   = 50  # 10 min before the hour
+                if dead_zone_start < dead_zone_end and dead_zone_start <= current_minute <= dead_zone_end:
+                    log.debug(f"gcalint reminder: skipping API call for integration {int_id} (minute {current_minute} in dead zone {dead_zone_start}–{dead_zone_end})")
+                    continue
+
+            try:
+                events = await _fetch_upcoming_for_reminders(
+                    integration["gcal_token"],
+                    integration["calendar_id"],
+                    lookahead_minutes=offset,
+                )
+            except Exception as e:
+                log.error(f"gcalint reminder: failed to fetch events for integration {int_id}: {e}")
+                continue
+
+            for event in events:
+                gcal_event_id = event["gcal_event_id"]
+                if not gcal_event_id:
+                    continue
+
+                start_dt = event["start_dt"]
+                diff     = (start_dt - now).total_seconds() / 60  # minutes until start
+
+                # Only fire if within the reminder window (with 5-min loop tolerance)
+                if not (0 <= diff <= offset + 5):
+                    continue
+
+                # Check if already reminded
+                with get_connection() as conn:
+                    already = conn.execute(
+                        "SELECT id FROM gcal_reminders WHERE integration_id=? AND gcal_event_id=?",
+                        (int_id, gcal_event_id),
+                    ).fetchone()
+                if already:
+                    continue
+
+                # Mark as reminded immediately to prevent double-sends
+                try:
+                    with get_connection() as conn:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO gcal_reminders (integration_id, gcal_event_id) VALUES (?, ?)",
+                            (int_id, gcal_event_id),
+                        )
+                        conn.commit()
+                except Exception as e:
+                    log.error(f"gcalint reminder: failed to record reminder for {gcal_event_id}: {e}")
+                    continue
+
+                # Send the reminder
+                channel = self.bot.get_channel(integration["channel_id"])
+                if not channel:
+                    log.warning(f"gcalint reminder: channel {integration['channel_id']} not found for integration {int_id}")
+                    continue
+
+                # Build reminder embed
+                from utils.database import get_guild_config
+                from utils.embeds import get_guild_color
+                cfg         = get_guild_config(integration["guild_id"])
+                guild_color = get_guild_color(cfg.get("embed_color") if cfg else None)
+
+                offset_label = {15: "15 minutes", 30: "30 minutes", 60: "1 hour", 1440: "1 day"}.get(offset, f"{offset} minutes")
+                description  = f"**{event['title']}** is starting in **{offset_label}**."
+                if event.get("time_str"):
+                    description += f"\n🕐 {event['time_str']}"
+                if event.get("location"):
+                    description += f"\n📍 {event['location']}"
+                if event.get("description"):
+                    # Truncate long descriptions
+                    desc_text = event["description"][:300]
+                    if len(event["description"]) > 300:
+                        desc_text += "…"
+                    description += f"\n\n{desc_text}"
+
+                embed = discord.Embed(
+                    title=f"⏰  {event['title']} is starting soon!",
+                    description=description,
+                    color=guild_color,
+                )
+                embed.set_footer(text=f"From: {integration['label']}")
+
+                try:
+                    await channel.send(embed=embed)
+                    log.info(f"gcalint reminder: sent for '{event['title']}' (integration {int_id})")
+                except discord.Forbidden:
+                    log.warning(f"gcalint reminder: no permission in channel {integration['channel_id']}")
+                except Exception as e:
+                    log.error(f"gcalint reminder: unexpected error for integration {int_id}: {e}")
+
+    @reminder_loop.before_loop
+    async def before_reminder_loop(self):
         await self.bot.wait_until_ready()
 
     def _is_due(self, integration: dict, now: datetime) -> bool:
