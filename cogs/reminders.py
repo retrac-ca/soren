@@ -20,7 +20,7 @@ IMPORTANT — timezone handling:
   Do NOT use SQL BETWEEN for ISO datetime comparison when events may be
   stored with mixed UTC offsets. SQLite compares them as raw strings,
   which gives wrong results for e.g. "2026-04-09T20:00:00-04:00".
-  Instead, fetch all unreminded events within a generous 2-hour lookahead
+  Instead, fetch all unreminded events within a generous lookahead
   window and do the precise comparison in Python after normalising to UTC.
 """
 
@@ -99,14 +99,17 @@ class Reminders(commands.Cog):
         Runs every 60 seconds.
 
         Strategy:
-          1. Fetch ALL unreminded events that start within the next 2 hours.
-             We use a generous upper bound so the SQL stays fast, but we do
-             NOT use BETWEEN on ISO strings because SQLite string-compares
-             them incorrectly when timezones differ (e.g. -04:00 vs +00:00).
-          2. In Python, convert every start_time to UTC and compute the exact
-             reminder fire time.
-          3. Only fire if we're within the -60s / +300s window (1 minute early
-             tolerance + 5-minute lookback for restarts).
+          1. Fetch ALL unreminded, non-cancelled events from the DB.
+          2. For each event, compute remind_at = start_time - reminder_offset.
+          3. Quick skip: if remind_at is more than 2 hours away, ignore for now.
+             NOTE: we skip based on remind_at (not start_time) so that long
+             offsets (e.g. 1-day reminders) are caught at the right time, and
+             so that events created close to their reminder window are not
+             missed because start_time happens to fall just outside the
+             now+2h lookahead.
+          4. Fire if now is within the -60s / +300s window around remind_at.
+             The 60s early tolerance covers loop jitter; the 300s lookback
+             means reminders survive a bot restart of up to 5 minutes.
         """
         now_utc     = datetime.now(timezone.utc)
         now_plus_2h = now_utc + timedelta(hours=2)
@@ -137,14 +140,22 @@ class Reminders(commands.Cog):
                 log.warning(f"Reminder: could not parse start_time for event {event_id}: {event['start_time']!r} — {e}")
                 continue
 
-            # Quick skip: event is more than 2 hours away — not our concern yet
-            if start_dt > now_plus_2h:
-                log.debug(f"Reminder: skipping event {event_id} '{event['title']}' — starts in >{2}h (start_utc={start_dt.isoformat()})")
-                continue
-
             offset_minutes = event.get("reminder_offset") or 15
             remind_at      = start_dt - timedelta(minutes=offset_minutes)
-            diff           = (now_utc - remind_at).total_seconds()
+
+            # Quick skip: reminder time is more than 2 hours away — not our
+            # concern yet. We check remind_at (not start_time) so that events
+            # with large offsets (e.g. 1-day reminders) enter the loop at the
+            # right moment, and events created close to their reminder window
+            # are never skipped just because start_time > now+2h.
+            if remind_at > now_plus_2h:
+                log.debug(
+                    f"Reminder: skipping event {event_id} '{event['title']}' — "
+                    f"remind_at={remind_at.isoformat()} > lookahead"
+                )
+                continue
+
+            diff = (now_utc - remind_at).total_seconds()
 
             log.info(
                 f"Reminder check: event {event_id} '{event['title']}' | "
@@ -201,7 +212,7 @@ class Reminders(commands.Cog):
         # Use the guild's custom embed color for reminders
         from utils.database import get_guild_config
         from utils.embeds import get_guild_color
-        cfg        = get_guild_config(channel.guild.id)
+        cfg         = get_guild_config(channel.guild.id)
         guild_color = get_guild_color(cfg.get("embed_color") if cfg else None)
 
         embed = discord.Embed(

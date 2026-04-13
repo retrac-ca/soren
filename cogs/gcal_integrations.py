@@ -765,7 +765,10 @@ class GcalIntegrations(commands.Cog):
         try:
             cutoff = (now - timedelta(days=30)).isoformat()
             with get_connection() as conn:
-                conn.execute("DELETE FROM gcal_reminders WHERE fired_at < ?", (cutoff,))
+                conn.execute(
+                    "DELETE FROM gcal_reminders WHERE fired_at IS NOT NULL AND fired_at < ?",
+                    (cutoff,),
+                )
                 conn.commit()
         except Exception as e:
             log.warning(f"gcalint reminder: cleanup failed: {e}")
@@ -838,8 +841,8 @@ class GcalIntegrations(commands.Cog):
                 try:
                     with get_connection() as conn:
                         conn.execute(
-                            "INSERT OR IGNORE INTO gcal_reminders (integration_id, gcal_event_id) VALUES (?, ?)",
-                            (int_id, gcal_event_id),
+                            "INSERT OR IGNORE INTO gcal_reminders (integration_id, gcal_event_id, fired_at) VALUES (?, ?, ?)",
+                            (int_id, gcal_event_id, now.isoformat()),
                         )
                         conn.commit()
                 except Exception as e:
