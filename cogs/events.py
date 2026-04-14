@@ -1,6 +1,3 @@
-## soren/cogs/events.py
-
-
 """
 cogs/events.py
 ===============
@@ -28,7 +25,7 @@ import io
 
 from utils.database import get_connection, is_premium, get_guild_config
 from utils.permissions import is_event_creator, check_setup
-from utils.embeds import build_event_embed, build_error_embed, build_success_embed, COLOR_EVENT
+from utils.embeds import build_event_embed, build_error_embed, build_success_embed, get_guild_color, COLOR_EVENT
 import logging
 
 try:
@@ -189,8 +186,6 @@ async def autocomplete_reminder(ctx: discord.AutocompleteContext):
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
 def build_listevents_embed(rows, guild):
-    from utils.database import get_guild_config
-    from utils.embeds import get_guild_color
     cfg   = get_guild_config(guild.id)
     color = get_guild_color(cfg.get("embed_color") if cfg else None)
     embed = discord.Embed(title="📅  Upcoming Events", color=color)
@@ -291,10 +286,13 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict, bot: 
     try:
         from cogs.modlogs import log_event, embed_event_created
         creator = channel.guild.get_member(event_data.get("creator_id", 0))
-        _bot = bot or channel._state._get_client()
-        if creator and _bot:
+        if bot is None:
+            log.warning(f"modlog hook (event created): bot reference is None — skipping modlog for event {event_data.get('id')}")
+        elif creator is None:
+            log.warning(f"modlog hook (event created): creator member not found (id={event_data.get('creator_id')}) — skipping modlog for event {event_data.get('id')}")
+        else:
             ml_embed = embed_event_created(event_data, creator)
-            await log_event(_bot, channel.guild.id, ml_embed)
+            await log_event(bot, channel.guild.id, ml_embed)
     except Exception as e:
         log.warning(f"modlog hook failed (event created): {e}")
 
@@ -798,7 +796,10 @@ class ListEventsView(discord.ui.View):
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
     def _build_embed(self):
-        embed = discord.Embed(title="📅  Upcoming Events", color=COLOR_EVENT)
+        # Use guild custom color — consistent with /listevents single-page path
+        cfg   = get_guild_config(self.guild.id)
+        color = get_guild_color(cfg.get("embed_color") if cfg else None)
+        embed = discord.Embed(title="📅  Upcoming Events", color=color)
         start = self.page * self.page_size
         for row in self.rows[start:start + self.page_size]:
             try:
@@ -825,7 +826,7 @@ class EditEventMentionsModal(discord.ui.Modal):
     """
     Update or clear the notify role(s) for an event.
     Free: one role. Premium: up to three roles (comma-separated).
-    Leave blank to clear all roles.
+    Type 'clear' or 'none' to remove all roles.
     Opened by /editeventmentions.
     """
 
@@ -855,9 +856,9 @@ class EditEventMentionsModal(discord.ui.Modal):
                 current_roles = role.name
 
         if premium:
-            placeholder = "Role name(s), comma-separated — up to 3. Type 'clear' or 'none' to remove all roles."
+            placeholder = "Up to 3 role names, comma-separated. Leave blank or type 'clear' to remove all roles."
         else:
-            placeholder = "Role name or ID. Type 'clear' or 'none' to remove the role."
+            placeholder = "Role name or ID. Leave blank or type 'clear' to remove the role."
 
         self.add_item(discord.ui.InputText(
             label="Notify Role(s)" if premium else "Notify Role",
@@ -875,7 +876,7 @@ class EditEventMentionsModal(discord.ui.Modal):
 
         raw_input = self.children[0].value.strip()
 
-        # Treat 'clear', 'none', or '-' as explicit clear signals
+        # Treat 'clear', 'none', '-', or blank as explicit clear signals
         is_clear_keyword = raw_input.lower() in ("clear", "none", "-", "")
         role_ids = []
         if raw_input and not is_clear_keyword:
@@ -1364,7 +1365,10 @@ class Events(commands.Cog):
         if not rows:
             await ctx.respond(embed=build_error_embed("You haven't RSVPed to any upcoming events in this server."), ephemeral=True)
             return
-        embed = discord.Embed(title="📅  My RSVPs", color=COLOR_EVENT)
+        # Use guild custom color — consistent with /listevents
+        cfg   = get_guild_config(ctx.guild.id)
+        color = get_guild_color(cfg.get("embed_color") if cfg else None)
+        embed = discord.Embed(title="📅  My RSVPs", color=color)
         for row in rows:
             try:
                 tz = pytz.timezone(row["timezone"] or "UTC")
@@ -1437,7 +1441,6 @@ class Events(commands.Cog):
             file=file,
             ephemeral=True,
         )
-
 
     # ── /editeventmentions ────────────────────────────────────────────────
     @discord.slash_command(name="editeventmentions", description="Update or clear the mention/reminder roles for an event.")
