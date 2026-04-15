@@ -1160,6 +1160,8 @@ class Events(commands.Cog):
 
         event = {
             "id":                  event_id,
+            "guild_id":            guild_id,
+            "creator_id":          ctx.author.id,
             "title":               title.strip(),
             "description":         (description or "").strip(),
             "timezone":            tz_name,

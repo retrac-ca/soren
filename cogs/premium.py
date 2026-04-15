@@ -99,7 +99,7 @@ class Premium(commands.Cog):
                 "• Up to 50 active events\n"
                 "• Up to 100 RSVP names shown\n"
                 "• All 10 embed colors\n"
-                "• Up to 10 G-Cal integrations\n"
+                "• Up to 5 G-Cal integrations\n"
                 "• Custom RSVP button labels\n\n"
                 "Run `/config` to confirm your server's plan."
             ),
@@ -144,7 +144,7 @@ class Premium(commands.Cog):
         )
         embed.add_field(
             name="\u2b50 Premium",
-            value="50\n100\n10 colors\n\u2705\nUp to 10\n\u2705",
+            value="50\n100\n10 colors\n\u2705\nUp to 5\n\u2705",
             inline=True,
         )
 

@@ -49,7 +49,7 @@ CREDS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 
 EVENTS_PER_PAGE    = 8
 FREE_GCAL_LIMIT    = 2
-PREMIUM_GCAL_LIMIT = 10
+PREMIUM_GCAL_LIMIT = 5   # ← change this one number to raise the premium limit
 
 # Pending OAuth flows keyed by guild_id
 _pending_flows: dict[int, object] = {}
@@ -493,25 +493,37 @@ class GcalIntegrations(commands.Cog):
             return
         guild_id = ctx.guild.id
 
-        if not is_premium(guild_id):
-            with get_connection() as conn:
-                count = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM gcal_integrations WHERE guild_id=?", (guild_id,)
-                ).fetchone()["cnt"]
-            if count >= FREE_GCAL_LIMIT:
-                await ctx.respond(
-                    embed=discord.Embed(
-                        title="❌  Calendar Limit Reached",
-                        description=(
-                            f"Free servers can connect up to **{FREE_GCAL_LIMIT} calendars** "
-                            f"({count}/{FREE_GCAL_LIMIT} used).\n\n"
-                            "Upgrade to **[Soren Premium](https://soren.retrac.ca)** for more integrations."
-                        ),
-                        color=discord.Color.red(),
-                    ),
-                    ephemeral=True,
+        premium = is_premium(guild_id)
+        limit   = PREMIUM_GCAL_LIMIT if premium else FREE_GCAL_LIMIT
+
+        with get_connection() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM gcal_integrations WHERE guild_id=?", (guild_id,)
+            ).fetchone()["cnt"]
+
+        if count >= limit:
+            if premium:
+                description = (
+                    f"Premium servers can connect up to **{PREMIUM_GCAL_LIMIT} calendars** "
+                    f"({count}/{PREMIUM_GCAL_LIMIT} used).\n\n"
+                    "Please remove an existing integration to add a new one."
                 )
-                return
+            else:
+                description = (
+                    f"Free servers can connect up to **{FREE_GCAL_LIMIT} calendars** "
+                    f"({count}/{FREE_GCAL_LIMIT} used).\n\n"
+                    "Upgrade to **[Soren Premium](https://soren.retrac.ca)** for up to "
+                    f"{PREMIUM_GCAL_LIMIT} integrations."
+                )
+            await ctx.respond(
+                embed=discord.Embed(
+                    title="❌  Calendar Limit Reached",
+                    description=description,
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return
 
         if not GCAL_AVAILABLE:
             await ctx.respond(embed=discord.Embed(description="❌ Google Calendar libraries are not installed.", color=discord.Color.red()), ephemeral=True)
