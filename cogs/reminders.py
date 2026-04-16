@@ -149,7 +149,7 @@ class Reminders(commands.Cog):
             # right moment, and events created close to their reminder window
             # are never skipped just because start_time > now+2h.
             if remind_at > now_plus_2h:
-                log.debug(
+                log.info(
                     f"Reminder: skipping event {event_id} '{event['title']}' — "
                     f"remind_at={remind_at.isoformat()} > lookahead"
                 )
