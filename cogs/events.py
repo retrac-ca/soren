@@ -52,7 +52,7 @@ def _parse_datetime(raw: str, tz_name: str) -> datetime | None:
         settings = {
             "TIMEZONE": tz_name,
             "RETURN_AS_TIMEZONE_AWARE": True,
-            "PREFER_DATES_FROM": "future",
+            "PREFER_DATES_FROM": "current-period",
             "DATE_ORDER": "MDY",
         }
         parsed = dateparser.parse(raw.strip(), settings=settings)
