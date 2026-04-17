@@ -503,8 +503,6 @@ class EditEventTimeModal(discord.ui.Modal):
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
 
-        # Defer immediately — dateparser can exceed Discord's 3s timeout,
-        # and deferring also lets us send proper error embeds via followup
         await interaction.response.defer(ephemeral=True)
 
         start_raw    = self.children[0].value.strip()
@@ -670,7 +668,7 @@ class DeleteConfirmView(discord.ui.View):
         super().__init__(timeout=60)
         self.event     = event
         self.author_id = author_id
-        self.message   = None   # Set after respond so on_timeout can edit it
+        self.message   = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -718,7 +716,6 @@ class DeleteConfirmView(discord.ui.View):
         )
 
     async def on_timeout(self):
-        """Disable buttons silently when the view times out."""
         for item in self.children:
             item.disabled = True
 
@@ -748,7 +745,6 @@ class WaitlistView(discord.ui.View):
             )
             conn.commit()
 
-        # Get position
         with get_connection() as conn:
             pos = conn.execute(
                 "SELECT COUNT(*) as cnt FROM waitlist WHERE event_id=? AND user_id <= (SELECT id FROM waitlist WHERE event_id=? AND user_id=?)",
@@ -796,7 +792,6 @@ class ListEventsView(discord.ui.View):
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
     def _build_embed(self):
-        # Use guild custom color — consistent with /listevents single-page path
         cfg   = get_guild_config(self.guild.id)
         color = get_guild_color(cfg.get("embed_color") if cfg else None)
         embed = discord.Embed(title="📅  Upcoming Events", color=color)
@@ -818,128 +813,6 @@ class ListEventsView(discord.ui.View):
         total = (len(self.rows) - 1) // self.page_size + 1
         embed.set_footer(text=f"Page {self.page + 1} of {total}")
         return embed
-
-
-# ── Edit Event Mentions Modal ─────────────────────────────────────────────────
-
-class EditEventMentionsModal(discord.ui.Modal):
-    """
-    Update or clear the notify role(s) for an event.
-    Free: one role. Premium: up to three roles (comma-separated).
-    Type 'clear' or 'none' to remove all roles.
-    Opened by /editeventmentions.
-    """
-
-    def __init__(self, event: dict, guild: discord.Guild, premium: bool, *args, **kwargs):
-        super().__init__(title="Edit Mention Roles", *args, **kwargs)
-        self.event   = event
-        self.premium = premium
-
-        import json as _json
-        # Pre-fill current roles as comma-separated role names
-        current_roles = ""
-        raw = event.get("notify_role_ids")
-        if raw:
-            try:
-                ids = _json.loads(raw)
-                names = []
-                for rid in ids:
-                    role = guild.get_role(int(rid))
-                    if role:
-                        names.append(role.name)
-                current_roles = ", ".join(names)
-            except Exception:
-                pass
-        if not current_roles and event.get("notify_role_id"):
-            role = guild.get_role(int(event["notify_role_id"]))
-            if role:
-                current_roles = role.name
-
-        if premium:
-            placeholder = "Up to 3 role names, comma-separated. Leave blank or type 'clear' to remove all roles."
-        else:
-            placeholder = "Role name or ID. Leave blank or type 'clear' to remove the role."
-
-        self.add_item(discord.ui.InputText(
-            label="Notify Role(s)" if premium else "Notify Role",
-            value=current_roles,
-            placeholder=placeholder,
-            required=False,
-            max_length=200,
-        ))
-
-    async def callback(self, interaction: discord.Interaction):
-        import json as _json
-        from cogs.rsvp import refresh_event_embed
-
-        await interaction.response.defer(ephemeral=True)
-
-        raw_input = self.children[0].value.strip()
-
-        # Treat 'clear', 'none', '-', or blank as explicit clear signals
-        is_clear_keyword = raw_input.lower() in ("clear", "none", "-", "")
-        role_ids = []
-        if raw_input and not is_clear_keyword:
-            # Split by comma, resolve each entry to a role
-            parts = [p.strip() for p in raw_input.split(",") if p.strip()]
-            # Free servers only get the first role
-            if not self.premium:
-                parts = parts[:1]
-            else:
-                parts = parts[:3]
-
-            for part in parts:
-                clean = part.lstrip("@").strip()
-                # Try by ID first, then by name
-                role = None
-                try:
-                    role = interaction.guild.get_role(int(clean))
-                except ValueError:
-                    role = discord.utils.find(
-                        lambda r: r.name.lower() == clean.lower(),
-                        interaction.guild.roles,
-                    )
-                if role:
-                    role_ids.append(role.id)
-                else:
-                    log.warning(f"editeventmentions: could not find role '{part}' in guild {interaction.guild.id}")
-
-        notify_role_ids_json  = _json.dumps(role_ids) if role_ids else None
-        notify_role_id_legacy = role_ids[0] if role_ids else None
-
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE events SET notify_role_id=?, notify_role_ids=? WHERE id=?",
-                (notify_role_id_legacy, notify_role_ids_json, self.event["id"]),
-            )
-            conn.commit()
-
-        if role_ids:
-            role_names = []
-            for rid in role_ids:
-                r = interaction.guild.get_role(rid)
-                role_names.append(r.mention if r else f"<@&{rid}>")
-            msg = f"Mention roles updated to: {', '.join(role_names)}"
-        else:
-            msg = "Mention roles cleared — no roles will be pinged for this event."
-
-        await interaction.followup.send(
-            embed=build_success_embed(msg),
-            ephemeral=True,
-        )
-        await refresh_event_embed(self.event["id"], interaction.guild, interaction.client)
-
-        # ── Modlog: event edited ──────────────────────────────────────────
-        try:
-            from cogs.modlogs import log_event, embed_event_edited
-            ml_embed = embed_event_edited(
-                self.event,
-                interaction.user,
-                "Mention/reminder roles",
-            )
-            await log_event(interaction.client, interaction.guild_id, ml_embed)
-        except Exception as e:
-            log.warning(f"modlog hook failed (editeventmentions): {e}")
 
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
@@ -1061,7 +934,7 @@ class Events(commands.Cog):
             return
 
         # ── Timezone ──────────────────────────────────────────────────────
-        tz_name    = timezone  # None if not provided
+        tz_name    = timezone
         tz_warning = ""
         if tz_name is None:
             tz_name    = "UTC"
@@ -1105,15 +978,12 @@ class Events(commands.Cog):
         # ── Recurrence ────────────────────────────────────────────────────
         recur_rule   = recurrence or "none"
         is_recurring = 0 if recur_rule == "none" else 1
-        # recur_interval only meaningful for custom; silently ignore otherwise
-        interval = recur_interval if recur_rule == "custom" else 7
+        interval     = recur_interval if recur_rule == "custom" else 7
 
         # ── Reminder ──────────────────────────────────────────────────────
         reminder_offset = max(1, reminder) if reminder else 15
 
-        # ── Roles — build notify_role_ids JSON array ──────────────────────
-        # Free servers: only role is used; role2/role3 are silently dropped
-        # Premium servers: all three accepted
+        # ── Roles ─────────────────────────────────────────────────────────
         role_ids      = []
         extra_ignored = False
 
@@ -1131,8 +1001,7 @@ class Events(commands.Cog):
                 extra_ignored = True
 
         import json
-        notify_role_ids_json = json.dumps(role_ids) if role_ids else None
-        # Keep legacy single-role column populated for backward compat
+        notify_role_ids_json  = json.dumps(role_ids) if role_ids else None
         notify_role_id_legacy = role_ids[0] if role_ids else None
 
         # ── Insert into DB ────────────────────────────────────────────────
@@ -1159,31 +1028,30 @@ class Events(commands.Cog):
             conn.commit()
 
         event = {
-            "id":                  event_id,
-            "guild_id":            guild_id,
-            "creator_id":          ctx.author.id,
-            "title":               title.strip(),
-            "description":         (description or "").strip(),
-            "timezone":            tz_name,
-            "start_time":          start_iso,
-            "end_time":            end_iso,
-            "is_recurring":        is_recurring,
-            "recur_rule":          recur_rule,
-            "recur_interval":      interval,
-            "channel_id":          channel.id,
-            "reminder_offset":     reminder_offset,
-            "notify_role_id":      notify_role_id_legacy,
-            "notify_role_ids":     notify_role_ids_json,
-            "max_rsvp":            max(0, max_rsvp),
-            "btn_accept_label":    "✅ Accept",
-            "btn_decline_label":   "❌ Decline",
-            "btn_tentative_label": "❓ Tentative",
+            "id":                    event_id,
+            "guild_id":              guild_id,
+            "creator_id":            ctx.author.id,
+            "title":                 title.strip(),
+            "description":           (description or "").strip(),
+            "timezone":              tz_name,
+            "start_time":            start_iso,
+            "end_time":              end_iso,
+            "is_recurring":          is_recurring,
+            "recur_rule":            recur_rule,
+            "recur_interval":        interval,
+            "channel_id":            channel.id,
+            "reminder_offset":       reminder_offset,
+            "notify_role_id":        notify_role_id_legacy,
+            "notify_role_ids":       notify_role_ids_json,
+            "max_rsvp":              max(0, max_rsvp),
+            "btn_accept_label":      "✅ Accept",
+            "btn_decline_label":     "❌ Decline",
+            "btn_tentative_label":   "❓ Tentative",
             "btn_tentative_enabled": 1,
         }
 
         await post_event_embed(channel, event, bot=ctx.bot)
 
-        # ── Success message ───────────────────────────────────────────────
         recur_str = RECUR_LABELS.get(recur_rule, recur_rule)
         if recur_rule == "custom":
             recur_str = f"Every {interval} days"
@@ -1266,7 +1134,6 @@ class Events(commands.Cog):
     # ── /listevents ───────────────────────────────────────────────────────
     @discord.slash_command(name="listevents", description="List all upcoming events in this server.")
     async def listevents(self, ctx: discord.ApplicationContext):
-        # Use start of today (UTC midnight) so events happening later today are included
         now = datetime.now(timezone.utc)
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         start_iso = start_of_day.isoformat()
@@ -1322,7 +1189,6 @@ class Events(commands.Cog):
 
         event = dict(row)
 
-        # Guard against cancelling an already-cancelled event
         if event["title"].startswith("[CANCELLED]"):
             await ctx.respond(
                 embed=build_error_embed("This event has already been cancelled."),
@@ -1340,7 +1206,6 @@ class Events(commands.Cog):
         from cogs.rsvp import refresh_event_embed
         await refresh_event_embed(event_id, ctx.guild, ctx.bot)
 
-        # ── Modlog: event cancelled ───────────────────────────────────────
         try:
             from cogs.modlogs import log_event, embed_event_cancelled
             cancelled_event = {**event, "title": cancelled_title}
@@ -1367,7 +1232,6 @@ class Events(commands.Cog):
         if not rows:
             await ctx.respond(embed=build_error_embed("You haven't RSVPed to any upcoming events in this server."), ephemeral=True)
             return
-        # Use guild custom color — consistent with /listevents
         cfg   = get_guild_config(ctx.guild.id)
         color = get_guild_color(cfg.get("embed_color") if cfg else None)
         embed = discord.Embed(title="📅  My RSVPs", color=color)
@@ -1386,7 +1250,6 @@ class Events(commands.Cog):
     # ── /exportevents ─────────────────────────────────────────────────────
     @discord.slash_command(name="exportevents", description="Export upcoming events as an .ics calendar file.")
     async def exportevents(self, ctx: discord.ApplicationContext):
-        """Generates a standard iCalendar (.ics) file for all upcoming events."""
         now_iso = datetime.now(timezone.utc).isoformat()
         with get_connection() as conn:
             rows = conn.execute(
@@ -1413,10 +1276,10 @@ class Events(commands.Cog):
                 s_dt = datetime.fromisoformat(event["start_time"]).astimezone(pytz.utc)
                 dtstart = s_dt.strftime("%Y%m%dT%H%M%SZ")
                 if event.get("end_time"):
-                    e_dt   = datetime.fromisoformat(event["end_time"]).astimezone(pytz.utc)
-                    dtend  = e_dt.strftime("%Y%m%dT%H%M%SZ")
+                    e_dt  = datetime.fromisoformat(event["end_time"]).astimezone(pytz.utc)
+                    dtend = e_dt.strftime("%Y%m%dT%H%M%SZ")
                 else:
-                    dtend  = (s_dt + timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
+                    dtend = (s_dt + timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
             except Exception:
                 continue
 
@@ -1449,18 +1312,137 @@ class Events(commands.Cog):
     async def editeventmentions(
         self,
         ctx: discord.ApplicationContext,
-        event_id: discord.Option(int, description="The event ID to update.", autocomplete=autocomplete_event_ids, required=True),
+        event_id: discord.Option(
+            int,
+            description="The event ID to update.",
+            autocomplete=autocomplete_event_ids,
+            required=True,
+        ),
+        role1: discord.Option(
+            discord.Role,
+            description="First notify role.",
+            required=False,
+            default=None,
+        ),
+        role2: discord.Option(
+            discord.Role,
+            description="Second notify role. ⭐ Premium only.",
+            required=False,
+            default=None,
+        ),
+        role3: discord.Option(
+            discord.Role,
+            description="Third notify role. ⭐ Premium only.",
+            required=False,
+            default=None,
+        ),
+        clear: discord.Option(
+            bool,
+            description="Set to True to remove all notify roles from this event.",
+            required=False,
+            default=False,
+        ),
     ):
         if not is_event_creator(ctx.author):
             await ctx.respond(embed=build_error_embed("You don't have the Event Creator role."), ephemeral=True)
             return
+
         with get_connection() as conn:
-            row = conn.execute("SELECT * FROM events WHERE id=? AND guild_id=?", (event_id, ctx.guild.id)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM events WHERE id=? AND guild_id=?",
+                (event_id, ctx.guild.id),
+            ).fetchone()
         if not row:
             await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
             return
+
+        event   = dict(row)
         premium = is_premium(ctx.guild.id)
-        await ctx.send_modal(EditEventMentionsModal(event=dict(row), guild=ctx.guild, premium=premium))
+
+        import json as _json
+
+        # ── Clear takes priority over everything ──────────────────────────
+        if clear:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE events SET notify_role_id=NULL, notify_role_ids=NULL WHERE id=?",
+                    (event_id,),
+                )
+                conn.commit()
+            await ctx.respond(
+                embed=build_success_embed(f"All notify roles cleared from **{event['title']}**."),
+                ephemeral=True,
+            )
+            from cogs.rsvp import refresh_event_embed
+            await refresh_event_embed(event_id, ctx.guild, ctx.bot)
+            try:
+                from cogs.modlogs import log_event, embed_event_edited
+                ml_embed = embed_event_edited(event, ctx.author, "Mention/reminder roles")
+                await log_event(ctx.bot, ctx.guild.id, ml_embed)
+            except Exception as e:
+                log.warning(f"modlog hook failed (editeventmentions clear): {e}")
+            return
+
+        # ── Premium check for role2 / role3 ──────────────────────────────
+        if (role2 or role3) and not premium:
+            await ctx.respond(
+                embed=build_error_embed(
+                    "Setting multiple notify roles requires **Soren Premium**.\n"
+                    "Free servers can assign 1 notify role per event. "
+                    "Use `/premium` to see what's included or visit the website to upgrade."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # ── Must provide at least one role if not clearing ────────────────
+        if not role1:
+            await ctx.respond(
+                embed=build_error_embed(
+                    "Please provide at least one role, or set `clear: True` to remove all roles."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # ── Build role list ───────────────────────────────────────────────
+        role_ids = [role1.id]
+        if role2:
+            role_ids.append(role2.id)
+        if role3:
+            role_ids.append(role3.id)
+
+        notify_role_ids_json  = _json.dumps(role_ids)
+        notify_role_id_legacy = role_ids[0]
+
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE events SET notify_role_id=?, notify_role_ids=? WHERE id=?",
+                (notify_role_id_legacy, notify_role_ids_json, event_id),
+            )
+            conn.commit()
+
+        role_mentions = []
+        for rid in role_ids:
+            r = ctx.guild.get_role(rid)
+            role_mentions.append(r.mention if r else f"<@&{rid}>")
+
+        await ctx.respond(
+            embed=build_success_embed(
+                f"Notify roles updated for **{event['title']}**: {', '.join(role_mentions)}"
+            ),
+            ephemeral=True,
+        )
+
+        from cogs.rsvp import refresh_event_embed
+        await refresh_event_embed(event_id, ctx.guild, ctx.bot)
+
+        try:
+            from cogs.modlogs import log_event, embed_event_edited
+            ml_embed = embed_event_edited(event, ctx.author, "Mention/reminder roles")
+            await log_event(ctx.bot, ctx.guild.id, ml_embed)
+        except Exception as e:
+            log.warning(f"modlog hook failed (editeventmentions): {e}")
 
 
 def setup(bot: discord.Bot):
