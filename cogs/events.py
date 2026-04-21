@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import pytz
 import io
 
-from utils.database import get_connection, is_premium, get_guild_config
+from utils.database import get_connection, is_premium, get_guild_config, parse_role_ids
 from utils.permissions import is_event_creator, check_setup
 from utils.embeds import build_event_embed, build_error_embed, build_success_embed, get_guild_color, COLOR_EVENT
 import logging
@@ -71,11 +71,6 @@ except ImportError:
 # ── Tier event limits ─────────────────────────────────────────────────────────
 FREE_EVENT_LIMIT    = 10
 PREMIUM_EVENT_LIMIT = 50
-
-# ── RSVP cooldown tracking (in-memory, per user per event) ───────────────────
-# key: (user_id, event_id) → timestamp of last interaction
-_rsvp_cooldowns: dict[tuple, datetime] = {}
-RSVP_COOLDOWN_SECONDS = 3
 
 # ── Timezone options ──────────────────────────────────────────────────────────
 TIMEZONES = [
@@ -213,7 +208,7 @@ def get_guild_event_count(guild_id: int) -> int:
     now_iso = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM events WHERE guild_id = ? AND start_time >= ? AND title NOT LIKE '[CANCELLED]%'",
+            "SELECT COUNT(*) as cnt FROM events WHERE guild_id = ? AND start_time >= ? AND is_cancelled = 0",
             (guild_id, now_iso),
         ).fetchone()
     return row["cnt"] if row else 0
@@ -244,7 +239,6 @@ def compute_next_start(start_iso: str, recur_rule: str, recur_interval: int) -> 
 
 async def post_event_embed(channel: discord.TextChannel, event_data: dict, bot: discord.Bot | None = None):
     """Build and post the event embed. Sends role ping then embed. Saves message_id back to DB."""
-    import json as _json
     from cogs.rsvp import EventView
 
     cfg = get_guild_config(channel.guild.id)
@@ -252,19 +246,8 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict, bot: 
 
     # ── Role ping — fires before the embed so it appears above it ────────
     ping_parts = []
-    raw = event_data.get("notify_role_ids")
-    if raw:
-        try:
-            ids = _json.loads(raw)
-            for rid in ids:
-                role = channel.guild.get_role(int(rid))
-                if role:
-                    ping_parts.append(role.mention)
-        except Exception:
-            pass
-    # Legacy single-role fallback
-    if not ping_parts and event_data.get("notify_role_id"):
-        role = channel.guild.get_role(int(event_data["notify_role_id"]))
+    for rid in parse_role_ids(event_data):
+        role = channel.guild.get_role(rid)
         if role:
             ping_parts.append(role.mention)
 
@@ -329,19 +312,9 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
     event = {**event, "embed_color": cfg.get("embed_color") if cfg else None}
 
     # ── Role ping ─────────────────────────────────────────────────────────
-    import json as _json
     ping_parts = []
-    raw = event.get("notify_role_ids")
-    if raw:
-        try:
-            for rid in _json.loads(raw):
-                role = channel.guild.get_role(int(rid))
-                if role:
-                    ping_parts.append(role.mention)
-        except Exception:
-            pass
-    if not ping_parts and event.get("notify_role_id"):
-        role = channel.guild.get_role(int(event["notify_role_id"]))
+    for rid in parse_role_ids(event):
+        role = channel.guild.get_role(rid)
         if role:
             ping_parts.append(role.mention)
     if ping_parts:
@@ -815,6 +788,89 @@ class ListEventsView(discord.ui.View):
         return embed
 
 
+# ── /newevent helpers ─────────────────────────────────────────────────────────
+
+def _validate_event_times(
+    start_raw: str, end_raw: str | None, tz_name: str
+) -> tuple[str, str | None] | tuple[None, str]:
+    """
+    Parse start and end time strings in the given timezone.
+    Returns (start_iso, end_iso) on success, or (None, error_message) on failure.
+    """
+    start_dt = _parse_datetime(start_raw, tz_name)
+    if not start_dt:
+        return None, (
+            "Couldn't parse the start date/time. "
+            "Try `2026-07-04 20:00`, `July 4 8pm`, or `next Friday 9pm`."
+        )
+    end_iso = None
+    if end_raw:
+        end_dt = _parse_datetime(end_raw, tz_name)
+        if not end_dt:
+            return None, "Couldn't parse the end date/time."
+        end_iso = end_dt.isoformat()
+    return start_dt.isoformat(), end_iso
+
+
+def _collect_role_ids(
+    role: discord.Role | None,
+    role2: discord.Role | None,
+    role3: discord.Role | None,
+    premium: bool,
+) -> tuple[list[int], bool]:
+    """
+    Build the notify role ID list from the three optional role options.
+    Returns (role_ids, extra_ignored) where extra_ignored is True when
+    role2/role3 were provided but dropped because the server is on the free plan.
+    """
+    role_ids: list[int] = []
+    extra_ignored = False
+    if role:
+        role_ids.append(role.id)
+    if role2:
+        if premium:
+            role_ids.append(role2.id)
+        else:
+            extra_ignored = True
+    if role3:
+        if premium:
+            role_ids.append(role3.id)
+        else:
+            extra_ignored = True
+    return role_ids, extra_ignored
+
+
+def _insert_event_row(
+    conn,
+    guild_id: int, channel_id: int, creator_id: int,
+    title: str, description: str, tz_name: str,
+    start_iso: str, end_iso: str | None,
+    is_recurring: int, recur_rule: str, recur_interval: int,
+    reminder_offset: int, notify_role_id: int | None,
+    notify_role_ids_json: str | None, max_rsvp: int,
+) -> int:
+    """Insert a new event row and return the new event ID."""
+    cursor = conn.execute(
+        """
+        INSERT INTO events
+            (guild_id, channel_id, creator_id, title, description,
+             timezone, start_time, end_time, is_recurring,
+             recur_rule, recur_interval, reminder_offset,
+             notify_role_id, notify_role_ids, max_rsvp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            guild_id, channel_id, creator_id,
+            title, description, tz_name,
+            start_iso, end_iso,
+            is_recurring, recur_rule, recur_interval, reminder_offset,
+            notify_role_id, notify_role_ids_json, max_rsvp,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
 class Events(commands.Cog):
@@ -934,11 +990,8 @@ class Events(commands.Cog):
             return
 
         # ── Timezone ──────────────────────────────────────────────────────
-        tz_name    = timezone
-        tz_warning = ""
-        if tz_name is None:
-            tz_name    = "UTC"
-            tz_warning = "\n⚠️ No timezone selected — event created in **UTC**. Use `/editeventtime` to fix this."
+        tz_name    = timezone or "UTC"
+        tz_warning = "" if timezone else "\n⚠️ No timezone selected — event created in **UTC**. Use `/editeventtime` to fix this."
 
         if tz_name not in pytz.all_timezones:
             await ctx.followup.send(
@@ -950,30 +1003,12 @@ class Events(commands.Cog):
             )
             return
 
-        # ── Parse start time ──────────────────────────────────────────────
-        start_dt = _parse_datetime(start, tz_name)
-        if not start_dt:
-            await ctx.followup.send(
-                embed=build_error_embed(
-                    "Couldn't parse the start date/time. "
-                    "Try `2026-07-04 20:00`, `July 4 8pm`, or `next Friday 9pm`."
-                ),
-                ephemeral=True,
-            )
+        # ── Parse times ───────────────────────────────────────────────────
+        start_iso, end_or_err = _validate_event_times(start, end, tz_name)
+        if start_iso is None:
+            await ctx.followup.send(embed=build_error_embed(end_or_err), ephemeral=True)
             return
-        start_iso = start_dt.isoformat()
-
-        # ── Parse end time (optional) ─────────────────────────────────────
-        end_iso = None
-        if end:
-            end_dt = _parse_datetime(end, tz_name)
-            if not end_dt:
-                await ctx.followup.send(
-                    embed=build_error_embed("Couldn't parse the end date/time."),
-                    ephemeral=True,
-                )
-                return
-            end_iso = end_dt.isoformat()
+        end_iso = end_or_err
 
         # ── Recurrence ────────────────────────────────────────────────────
         recur_rule   = recurrence or "none"
@@ -984,48 +1019,22 @@ class Events(commands.Cog):
         reminder_offset = max(1, reminder) if reminder else 15
 
         # ── Roles ─────────────────────────────────────────────────────────
-        role_ids      = []
-        extra_ignored = False
-
-        if role:
-            role_ids.append(role.id)
-        if role2:
-            if premium:
-                role_ids.append(role2.id)
-            else:
-                extra_ignored = True
-        if role3:
-            if premium:
-                role_ids.append(role3.id)
-            else:
-                extra_ignored = True
-
         import json
-        notify_role_ids_json  = json.dumps(role_ids) if role_ids else None
-        notify_role_id_legacy = role_ids[0] if role_ids else None
+        role_ids, extra_ignored   = _collect_role_ids(role, role2, role3, premium)
+        notify_role_ids_json      = json.dumps(role_ids) if role_ids else None
+        notify_role_id_legacy     = role_ids[0] if role_ids else None
 
         # ── Insert into DB ────────────────────────────────────────────────
         with get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO events
-                    (guild_id, channel_id, creator_id, title, description,
-                     timezone, start_time, end_time, is_recurring,
-                     recur_rule, recur_interval, reminder_offset,
-                     notify_role_id, notify_role_ids, max_rsvp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    guild_id, channel.id, ctx.author.id,
-                    title.strip(), (description or "").strip(),
-                    tz_name, start_iso, end_iso,
-                    is_recurring, recur_rule, interval, reminder_offset,
-                    notify_role_id_legacy, notify_role_ids_json,
-                    max(0, max_rsvp),
-                ),
+            event_id = _insert_event_row(
+                conn,
+                guild_id, channel.id, ctx.author.id,
+                title.strip(), (description or "").strip(), tz_name,
+                start_iso, end_iso,
+                is_recurring, recur_rule, interval, reminder_offset,
+                notify_role_id_legacy, notify_role_ids_json,
+                max(0, max_rsvp),
             )
-            event_id = cursor.lastrowid
-            conn.commit()
 
         event = {
             "id":                    event_id,
@@ -1140,7 +1149,7 @@ class Events(commands.Cog):
 
         with get_connection() as conn:
             rows = conn.execute(
-                "SELECT id, title, start_time, timezone, channel_id, is_recurring, recur_rule FROM events WHERE guild_id=? AND start_time >= ? AND title NOT LIKE '[CANCELLED]%' ORDER BY start_time ASC",
+                "SELECT id, title, start_time, timezone, channel_id, is_recurring, recur_rule FROM events WHERE guild_id=? AND start_time >= ? AND is_cancelled = 0 ORDER BY start_time ASC",
                 (ctx.guild.id, start_iso),
             ).fetchall()
         if not rows:
@@ -1189,7 +1198,7 @@ class Events(commands.Cog):
 
         event = dict(row)
 
-        if event["title"].startswith("[CANCELLED]"):
+        if event.get("is_cancelled"):
             await ctx.respond(
                 embed=build_error_embed("This event has already been cancelled."),
                 ephemeral=True,
@@ -1199,7 +1208,7 @@ class Events(commands.Cog):
         cancelled_title = f"[CANCELLED] {event['title']}"
         cancelled_desc  = (event.get("description") or "") + "\n\n*This event has been cancelled.*"
         with get_connection() as conn:
-            conn.execute("UPDATE events SET title=?, description=? WHERE id=?", (cancelled_title, cancelled_desc, event_id))
+            conn.execute("UPDATE events SET title=?, description=?, is_cancelled=1 WHERE id=?", (cancelled_title, cancelled_desc, event_id))
             conn.commit()
 
         await ctx.respond(embed=build_success_embed(f"Event **{event['title']}** (ID: `{event_id}`) marked as cancelled."), ephemeral=True)
@@ -1224,7 +1233,7 @@ class Events(commands.Cog):
                 SELECT e.id, e.title, e.start_time, e.timezone, e.channel_id, r.status
                 FROM rsvps r JOIN events e ON r.event_id = e.id
                 WHERE r.user_id=? AND e.guild_id=? AND e.start_time >= ? AND r.status IN ('accepted','tentative')
-                AND e.title NOT LIKE '[CANCELLED]%'
+                AND e.is_cancelled = 0
                 ORDER BY e.start_time ASC
                 """,
                 (ctx.author.id, ctx.guild.id, now_iso),
@@ -1359,7 +1368,7 @@ class Events(commands.Cog):
         event   = dict(row)
         premium = is_premium(ctx.guild.id)
 
-        import json as _json
+        import json
 
         # ── Clear takes priority over everything ──────────────────────────
         if clear:
@@ -1412,7 +1421,7 @@ class Events(commands.Cog):
         if role3:
             role_ids.append(role3.id)
 
-        notify_role_ids_json  = _json.dumps(role_ids)
+        notify_role_ids_json  = json.dumps(role_ids)
         notify_role_id_legacy = role_ids[0]
 
         with get_connection() as conn:

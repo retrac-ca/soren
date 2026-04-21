@@ -51,6 +51,7 @@ class Premium(commands.Cog):
 
     def __init__(self, bot: discord.Bot):
         self.bot = bot
+        self._valid_keys: set[str] = load_valid_keys()
 
     # ── /premiumcode ──────────────────────────────────────────────────────
     @discord.slash_command(name="premiumcode", description="Redeem a premium code to unlock Soren Premium for this server.")
@@ -60,10 +61,9 @@ class Premium(commands.Cog):
         ctx: discord.ApplicationContext,
         code: discord.Option(str, description="Your premium redemption code.", required=True),
     ):
-        code       = code.strip().upper()
-        valid_keys = load_valid_keys()
+        code = code.strip().upper()
 
-        if code not in valid_keys:
+        if code not in self._valid_keys:
             log.warning(f"Invalid premium code attempt: '{code}' in guild {ctx.guild.id} by {ctx.author}")
             await ctx.respond(
                 embed=build_error_embed("That code is invalid. Please double-check and try again."),

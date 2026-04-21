@@ -7,6 +7,7 @@ Every table used by Soren is defined and created here via init_db().
 
 import sqlite3
 import os
+import json
 import logging
 
 log = logging.getLogger("soren.db")
@@ -92,14 +93,20 @@ def init_db():
     ]:
         try:
             cursor.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
-        except Exception:
-            pass
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                log.warning(f"Migration warning (events.{col}): {e}")
+        except Exception as e:
+            log.error(f"Unexpected migration error (events.{col}): {e}")
 
     # ── Migration: guild_config ───────────────────────────────────────────
     try:
         cursor.execute("ALTER TABLE guild_config ADD COLUMN embed_color TEXT DEFAULT '5865F2'")
-    except Exception:
-        pass
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            log.warning(f"Migration warning (guild_config.embed_color): {e}")
+    except Exception as e:
+        log.error(f"Unexpected migration error (guild_config.embed_color): {e}")
 
     # ── RSVPs ─────────────────────────────────────────────────────────────
     cursor.execute("""
@@ -152,8 +159,11 @@ def init_db():
     # ── Migration: gcal_integrations — add calendar_name column ──────────
     try:
         cursor.execute("ALTER TABLE gcal_integrations ADD COLUMN calendar_name TEXT")
-    except Exception:
-        pass
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            log.warning(f"Migration warning (gcal_integrations.calendar_name): {e}")
+    except Exception as e:
+        log.error(f"Unexpected migration error (gcal_integrations.calendar_name): {e}")
 
     # ── Migration: gcal_integrations — add reminder columns ──────────────
     for col, definition in [
@@ -162,8 +172,11 @@ def init_db():
     ]:
         try:
             cursor.execute(f"ALTER TABLE gcal_integrations ADD COLUMN {col} {definition}")
-        except Exception:
-            pass
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                log.warning(f"Migration warning (gcal_integrations.{col}): {e}")
+        except Exception as e:
+            log.error(f"Unexpected migration error (gcal_integrations.{col}): {e}")
 
     # ── GCal integration reminders — tracks which events have been reminded ──
     cursor.execute("""
@@ -198,8 +211,23 @@ def init_db():
     # ── Migration: events — notify_role_ids ───────────────────────────────
     try:
         cursor.execute("ALTER TABLE events ADD COLUMN notify_role_ids TEXT")
-    except Exception:
-        pass
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            log.warning(f"Migration warning (events.notify_role_ids): {e}")
+    except Exception as e:
+        log.error(f"Unexpected migration error (events.notify_role_ids): {e}")
+
+    # ── Migration: events — is_cancelled ──────────────────────────────────
+    try:
+        cursor.execute("ALTER TABLE events ADD COLUMN is_cancelled INTEGER DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            log.warning(f"Migration warning (events.is_cancelled): {e}")
+    except Exception as e:
+        log.error(f"Unexpected migration error (events.is_cancelled): {e}")
+
+    # Backfill: mark any events whose title starts with [CANCELLED]
+    cursor.execute("UPDATE events SET is_cancelled=1 WHERE title LIKE '[CANCELLED]%' AND is_cancelled=0")
 
     conn.commit()
     conn.close()
@@ -242,3 +270,23 @@ def is_premium(guild_id: int) -> bool:
     """Return True if the guild has premium status."""
     config = get_guild_config(guild_id)
     return bool(config and config.get("is_premium"))
+
+
+def parse_role_ids(event: dict) -> list[int]:
+    """
+    Return notify role IDs for an event as a list of ints.
+    Reads notify_role_ids (JSON array) first; falls back to the
+    legacy notify_role_id integer column for older rows.
+    """
+    raw = event.get("notify_role_ids")
+    if raw:
+        try:
+            ids = json.loads(raw)
+            if isinstance(ids, list) and ids:
+                return [int(i) for i in ids if i]
+        except (json.JSONDecodeError, ValueError):
+            pass
+    legacy = event.get("notify_role_id")
+    if legacy:
+        return [int(legacy)]
+    return []

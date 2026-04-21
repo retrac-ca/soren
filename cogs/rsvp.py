@@ -214,8 +214,9 @@ class EventView(discord.ui.View):
             # ── Cooldown check ────────────────────────────────────────────
             cooldown_key = (interaction.user.id, self.event_id)
             now = datetime.now(timezone.utc)
-            last = _rsvp_cooldowns.get(cooldown_key)
+            last = _rsvp_cooldowns.pop(cooldown_key, None)
             if last and (now - last).total_seconds() < RSVP_COOLDOWN_SECONDS:
+                _rsvp_cooldowns[cooldown_key] = last  # still cooling down — put it back
                 await interaction.response.send_message(
                     "You're clicking too fast — please wait a moment before changing your RSVP.",
                     ephemeral=True,

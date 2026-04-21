@@ -31,7 +31,7 @@ import pytz
 import json
 import logging
 
-from utils.database import get_connection
+from utils.database import get_connection, parse_role_ids
 from utils.embeds import build_reminder_embed
 from cogs.events import compute_next_start, repost_recurring_embed
 
@@ -57,27 +57,6 @@ def _try_refresh_token(token_json: str, creds_file: str) -> str | None:
     except Exception as e:
         log.error(f"Failed to refresh OAuth token: {e}")
         return None
-
-
-def _parse_role_ids(event: dict) -> list[int]:
-    """
-    Return a list of notify role IDs for an event.
-    Reads the new notify_role_ids JSON array first; falls back to the
-    legacy notify_role_id integer column for older rows.
-    """
-    raw = event.get("notify_role_ids")
-    if raw:
-        try:
-            ids = json.loads(raw)
-            if isinstance(ids, list) and ids:
-                return [int(i) for i in ids if i]
-        except (json.JSONDecodeError, ValueError):
-            pass
-    # Legacy single-role fallback
-    legacy = event.get("notify_role_id")
-    if legacy:
-        return [int(legacy)]
-    return []
 
 
 class Reminders(commands.Cog):
@@ -126,7 +105,7 @@ class Reminders(commands.Cog):
             event_id = event["id"]
 
             # Skip cancelled events — they should never send reminders
-            if event.get("title", "").startswith("[CANCELLED]"):
+            if event.get("is_cancelled"):
                 log.debug(f"Reminder: skipping cancelled event {event_id} '{event['title']}'")
                 continue
 
@@ -227,7 +206,7 @@ class Reminders(commands.Cog):
 
         # ── Role pings only — supports both new multi-role and legacy single-role ──
         ping_parts = []
-        role_ids = _parse_role_ids(event)
+        role_ids = parse_role_ids(event)
         for role_id in role_ids:
             role = channel.guild.get_role(role_id)
             if role:
