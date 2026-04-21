@@ -31,7 +31,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from math import ceil
 
-from utils.database import get_connection, upsert_guild_config, is_premium
+from utils.database import get_connection, upsert_guild_config, is_premium, get_guild_config
+from utils.embeds import get_guild_color
 
 log = logging.getLogger("soren.gcalint")
 
@@ -674,17 +675,20 @@ class GcalIntegrations(commands.Cog):
                 (ctx.guild.id,),
             ).fetchall()
 
+        cfg   = get_guild_config(ctx.guild.id)
+        color = get_guild_color(cfg.get("embed_color") if cfg else None)
+
         if not rows:
             await ctx.respond(
                 embed=discord.Embed(
                     description="No calendars connected yet. Use `/gcalint add` to connect one.",
-                    color=discord.Color.blurple(),
+                    color=color,
                 ),
                 ephemeral=True,
             )
             return
 
-        embed = discord.Embed(title="📆  Connected Calendars", color=discord.Color.blurple())
+        embed = discord.Embed(title="📆  Connected Calendars", color=color)
         for row in rows:
             status = "✅ Active" if row["active"] else "⏸️ Paused"
             if row["schedule"] == "weekly":
