@@ -1082,6 +1082,107 @@ class Events(commands.Cog):
             ephemeral=True,
         )
 
+    # ── /duplicateevent ───────────────────────────────────────────────────
+    @discord.slash_command(name="duplicateevent", description="Clone an existing event to a new date and time.")
+    async def duplicateevent(
+        self,
+        ctx: discord.ApplicationContext,
+        event_id: discord.Option(int, description="The event ID to duplicate.", autocomplete=autocomplete_event_ids, required=True),
+        start: discord.Option(str, description="New start date & time. e.g. 2026-07-04 20:00 or 'July 4 8pm'", required=True),
+        end: discord.Option(str, description="New end date & time (optional).", required=False, default=None),
+    ):
+        if not is_event_creator(ctx.author):
+            await ctx.respond(embed=build_error_embed("You don't have the Event Creator role."), ephemeral=True)
+            return
+
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM events WHERE id=? AND guild_id=?", (event_id, ctx.guild.id)).fetchone()
+        if not row:
+            await ctx.respond(embed=build_error_embed(f"No event found with ID `{event_id}`."), ephemeral=True)
+            return
+
+        original = dict(row)
+        tz_name  = original.get("timezone") or "UTC"
+
+        await ctx.defer(ephemeral=True)
+
+        # ── Parse new times in the original event's timezone ──────────────
+        start_iso, end_or_err = _validate_event_times(start, end, tz_name)
+        if start_iso is None:
+            await ctx.followup.send(embed=build_error_embed(end_or_err), ephemeral=True)
+            return
+        end_iso = end_or_err
+
+        # ── Check tier cap ────────────────────────────────────────────────
+        premium  = is_premium(ctx.guild.id)
+        guild_id = ctx.guild.id
+        if not premium and get_guild_event_count(guild_id) >= FREE_EVENT_LIMIT:
+            await ctx.followup.send(
+                embed=build_error_embed(
+                    f"Free servers are limited to **{FREE_EVENT_LIMIT} active events**. "
+                    "Delete or cancel an old event, or upgrade to Premium."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # ── Insert cloned row ─────────────────────────────────────────────
+        with get_connection() as conn:
+            new_id = _insert_event_row(
+                conn,
+                guild_id, original["channel_id"], ctx.author.id,
+                original["title"], original.get("description") or "",
+                tz_name, start_iso, end_iso,
+                original.get("is_recurring", 0),
+                original.get("recur_rule") or "none",
+                original.get("recur_interval") or 7,
+                original.get("reminder_offset") or 15,
+                original.get("notify_role_id"),
+                original.get("notify_role_ids"),
+                original.get("max_rsvp") or 0,
+            )
+
+        # ── Build event dict for embed (carry over button/color settings) ─
+        new_event = {
+            "id":                    new_id,
+            "guild_id":              guild_id,
+            "creator_id":            ctx.author.id,
+            "title":                 original["title"],
+            "description":           original.get("description") or "",
+            "timezone":              tz_name,
+            "start_time":            start_iso,
+            "end_time":              end_iso,
+            "is_recurring":          original.get("is_recurring", 0),
+            "recur_rule":            original.get("recur_rule") or "none",
+            "recur_interval":        original.get("recur_interval") or 7,
+            "channel_id":            original["channel_id"],
+            "reminder_offset":       original.get("reminder_offset") or 15,
+            "notify_role_id":        original.get("notify_role_id"),
+            "notify_role_ids":       original.get("notify_role_ids"),
+            "max_rsvp":              original.get("max_rsvp") or 0,
+            "btn_accept_label":      original.get("btn_accept_label") or "✅ Accept",
+            "btn_tentative_label":   original.get("btn_tentative_label") or "❓ Tentative",
+            "btn_decline_label":     original.get("btn_decline_label") or "❌ Decline",
+            "btn_tentative_enabled": original.get("btn_tentative_enabled", 1),
+        }
+
+        channel = ctx.guild.get_channel(original["channel_id"])
+        if not channel:
+            await ctx.followup.send(embed=build_error_embed("The original event's channel no longer exists."), ephemeral=True)
+            return
+
+        await post_event_embed(channel, new_event, bot=ctx.bot)
+
+        log.info(f"Event duplicated: original ID {event_id} → new ID {new_id} in guild {guild_id} by {ctx.author}")
+
+        await ctx.followup.send(
+            embed=build_success_embed(
+                f"**{original['title']}** duplicated to {channel.mention}!\n"
+                f"New ID: `{new_id}`"
+            ),
+            ephemeral=True,
+        )
+
     # ── /editeventdetails ─────────────────────────────────────────────────
     @discord.slash_command(name="editeventdetails", description="Edit an event's title, description, max RSVPs, or notify role.")
     async def editeventdetails(
