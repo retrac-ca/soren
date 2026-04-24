@@ -239,6 +239,19 @@ def init_db():
     # Backfill: mark any events whose title starts with [CANCELLED]
     cursor.execute("UPDATE events SET is_cancelled=1 WHERE title LIKE '[CANCELLED]%' AND is_cancelled=0")
 
+    # ── Migration: events — thread_id / thread_archived ───────────────────
+    for col, definition in [
+        ("thread_id",       "INTEGER"),
+        ("thread_archived", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                log.warning(f"Migration warning (events.{col}): {e}")
+        except Exception as e:
+            log.error(f"Unexpected migration error (events.{col}): {e}")
+
     conn.commit()
     conn.close()
     log.info("Database initialised successfully.")

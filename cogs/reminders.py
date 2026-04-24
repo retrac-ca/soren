@@ -93,6 +93,40 @@ class Reminders(commands.Cog):
         now_utc     = datetime.now(timezone.utc)
         now_plus_2h = now_utc + timedelta(hours=2)
 
+        # ── Archive threads for events that have ended ────────────────────
+        with get_connection() as conn:
+            threaded = conn.execute(
+                "SELECT id, thread_id, end_time, start_time FROM events "
+                "WHERE thread_id IS NOT NULL AND thread_archived = 0"
+            ).fetchall()
+
+        for trow in threaded:
+            tev = dict(trow)
+            archive_after_str = tev.get("end_time") or tev.get("start_time")
+            if not archive_after_str:
+                continue
+            try:
+                archive_after = datetime.fromisoformat(archive_after_str)
+                if archive_after.tzinfo is None:
+                    archive_after = archive_after.replace(tzinfo=timezone.utc)
+                else:
+                    archive_after = archive_after.astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if now_utc < archive_after:
+                continue
+            # Mark first so a failed Discord call doesn't cause repeated attempts
+            with get_connection() as conn:
+                conn.execute("UPDATE events SET thread_archived=1 WHERE id=?", (tev["id"],))
+                conn.commit()
+            try:
+                thread = self.bot.get_channel(tev["thread_id"]) or await self.bot.fetch_channel(tev["thread_id"])
+                if thread:
+                    await thread.edit(archived=True)
+                    log.info(f"Archived thread {tev['thread_id']} for ended event {tev['id']}")
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.warning(f"reminder_loop: could not archive thread {tev['thread_id']} for event {tev['id']}: {e}")
+
         with get_connection() as conn:
             events = conn.execute(
                 "SELECT * FROM events WHERE reminded_at IS NULL"

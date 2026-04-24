@@ -265,6 +265,20 @@ async def post_event_embed(channel: discord.TextChannel, event_data: dict, bot: 
         conn.execute("UPDATE events SET message_id = ? WHERE id = ?", (msg.id, event_data["id"]))
         conn.commit()
 
+    # ── Discussion thread ─────────────────────────────────────────────────
+    try:
+        thread = await msg.create_thread(
+            name=event_data["title"][:100],
+            auto_archive_duration=10080,
+        )
+        await thread.send("Use this thread for questions and coordination about the event.")
+        with get_connection() as conn:
+            conn.execute("UPDATE events SET thread_id=? WHERE id=?", (thread.id, event_data["id"]))
+            conn.commit()
+        log.info(f"Created discussion thread {thread.id} for event {event_data['id']}")
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(f"post_event_embed: could not create thread for event {event_data['id']}: {e}")
+
     # ── Modlog: event created ─────────────────────────────────────────────
     try:
         from cogs.modlogs import log_event, embed_event_created
@@ -299,6 +313,15 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
     if not channel:
         return
 
+    # Archive the old discussion thread before deleting the message
+    if event.get("thread_id"):
+        try:
+            old_thread = guild.get_thread(event["thread_id"]) or await guild.fetch_channel(event["thread_id"])
+            if old_thread:
+                await old_thread.edit(archived=True)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
     # Delete the old embed
     if event.get("message_id"):
         try:
@@ -330,11 +353,26 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
     try:
         new_msg = await channel.send(embed=embed, view=view)
         with get_connection() as conn:
-            conn.execute("UPDATE events SET message_id=? WHERE id=?", (new_msg.id, event_id))
+            conn.execute("UPDATE events SET message_id=?, thread_id=NULL, thread_archived=0 WHERE id=?", (new_msg.id, event_id))
             conn.commit()
         log.info(f"Reposted embed for recurring event {event_id}")
     except discord.Forbidden:
         log.warning(f"repost_recurring_embed: no permission in channel {channel.id}")
+        return
+
+    # Create a fresh discussion thread on the new message
+    try:
+        new_thread = await new_msg.create_thread(
+            name=event["title"][:100],
+            auto_archive_duration=10080,
+        )
+        await new_thread.send("Use this thread for questions and coordination about the event.")
+        with get_connection() as conn:
+            conn.execute("UPDATE events SET thread_id=? WHERE id=?", (new_thread.id, event_id))
+            conn.commit()
+        log.info(f"Created discussion thread {new_thread.id} for recurring event {event_id}")
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(f"repost_recurring_embed: could not create thread for event {event_id}: {e}")
 
 
 # ── Edit Event Details Modal ──────────────────────────────────────────────────
@@ -687,6 +725,15 @@ class DeleteConfirmView(discord.ui.View):
                 await msg.delete()
         except discord.NotFound:
             pass
+
+        # Delete the discussion thread if one exists
+        if event.get("thread_id"):
+            try:
+                thread = interaction.guild.get_thread(event["thread_id"]) or await interaction.client.fetch_channel(event["thread_id"])
+                if thread:
+                    await thread.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
         with get_connection() as conn:
             conn.execute("DELETE FROM events WHERE id=?", (event["id"],))
@@ -1360,6 +1407,18 @@ class Events(commands.Cog):
         await ctx.respond(embed=build_success_embed(f"Event **{event['title']}** (ID: `{event_id}`) marked as cancelled."), ephemeral=True)
         from cogs.rsvp import refresh_event_embed
         await refresh_event_embed(event_id, ctx.guild, ctx.bot)
+
+        # Archive the discussion thread immediately on cancellation
+        if event.get("thread_id"):
+            try:
+                thread = ctx.guild.get_thread(event["thread_id"]) or await ctx.bot.fetch_channel(event["thread_id"])
+                if thread:
+                    await thread.edit(archived=True)
+                    with get_connection() as conn:
+                        conn.execute("UPDATE events SET thread_archived=1 WHERE id=?", (event_id,))
+                        conn.commit()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.warning(f"cancelevent: could not archive thread for event {event_id}: {e}")
 
         try:
             from cogs.modlogs import log_event, embed_event_cancelled
