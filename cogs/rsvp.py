@@ -229,6 +229,22 @@ class EventView(discord.ui.View):
                 await interaction.response.send_message("This event no longer exists.", ephemeral=True)
                 return
 
+            # ── RSVP cutoff check ─────────────────────────────────────────
+            cutoff = event.get("rsvp_cutoff")
+            if cutoff:
+                try:
+                    cutoff_dt = datetime.fromisoformat(cutoff)
+                    if cutoff_dt.tzinfo is None:
+                        cutoff_dt = cutoff_dt.replace(tzinfo=timezone.utc)
+                    if now > cutoff_dt.astimezone(timezone.utc):
+                        await interaction.response.send_message(
+                            "Signups for this event are closed.",
+                            ephemeral=True,
+                        )
+                        return
+                except (ValueError, TypeError):
+                    pass
+
             # ── Max RSVP / waitlist check ─────────────────────────────────
             if status == "accepted" and event.get("max_rsvp", 0) > 0:
                 with get_connection() as conn:

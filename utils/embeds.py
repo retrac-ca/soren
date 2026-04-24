@@ -87,13 +87,31 @@ def build_event_embed(event: dict, rsvps: dict) -> discord.Embed:
         rule = event.get("recur_rule", "recurring")
         recur_label = f"🔁 **Recurring** ({rule})\n"
 
+    # ── RSVP cutoff line ─────────────────────────────────────────────────
+    cutoff_str = ""
+    if event.get("rsvp_cutoff"):
+        try:
+            tz      = pytz.timezone(tz_name)
+            cut_dt  = datetime.fromisoformat(event["rsvp_cutoff"]).astimezone(tz)
+            now_utc = datetime.now(pytz.utc)
+            cutoff_dt_utc = datetime.fromisoformat(event["rsvp_cutoff"])
+            if cutoff_dt_utc.tzinfo is None:
+                cutoff_dt_utc = cutoff_dt_utc.replace(tzinfo=pytz.utc)
+            if now_utc > cutoff_dt_utc.astimezone(pytz.utc):
+                cutoff_str = f"\n🔒 **Signups closed**"
+            else:
+                cutoff_str = f"\n🔒 Signups close: **{cut_dt.strftime('%b %d  •  %I:%M %p %Z')}**"
+        except Exception:
+            pass
+
     # ── Build embed ──────────────────────────────────────────────────────
     guild_color = get_guild_color(event.get("embed_color"))
     embed = discord.Embed(
         title=f"📅  {event['title']}",
         description=(
             f"{recur_label}"
-            f"🕐 **{time_str}{end_str}**\n\n"
+            f"🕐 **{time_str}{end_str}**"
+            f"{cutoff_str}\n\n"
             f"{event.get('description', '')}"
         ),
         color=guild_color,

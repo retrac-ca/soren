@@ -472,6 +472,19 @@ class EditEventTimeModal(discord.ui.Modal):
             value=str(event.get("reminder_offset") or 15),
             max_length=4,
         ))
+        existing_cutoff = ""
+        if event.get("rsvp_cutoff"):
+            try:
+                existing_cutoff = event["rsvp_cutoff"][:16].replace("T", " ")
+            except Exception:
+                pass
+        self.add_item(discord.ui.InputText(
+            label="RSVP Cutoff (optional, leave blank to clear)",
+            value=existing_cutoff,
+            placeholder="e.g. 2026-07-04 19:00  — signups close at this time",
+            required=False,
+            max_length=50,
+        ))
 
     async def callback(self, interaction: discord.Interaction):
         from cogs.rsvp import refresh_event_embed
@@ -482,6 +495,7 @@ class EditEventTimeModal(discord.ui.Modal):
         end_raw      = self.children[1].value.strip()
         tz_name      = self.children[2].value.strip() or "UTC"
         reminder_raw = self.children[3].value.strip()
+        cutoff_raw   = self.children[4].value.strip()
 
         if tz_name not in pytz.all_timezones:
             await interaction.followup.send(
@@ -521,10 +535,21 @@ class EditEventTimeModal(discord.ui.Modal):
                 return
             end_iso = end_dt.isoformat()
 
+        cutoff_iso = None
+        if cutoff_raw:
+            cutoff_dt = _parse_datetime(cutoff_raw, tz_name)
+            if not cutoff_dt:
+                await interaction.followup.send(
+                    embed=build_error_embed("Couldn't parse the RSVP cutoff date/time."),
+                    ephemeral=True,
+                )
+                return
+            cutoff_iso = cutoff_dt.isoformat()
+
         with get_connection() as conn:
             conn.execute(
-                "UPDATE events SET start_time=?, end_time=?, timezone=?, reminder_offset=?, reminded_at=NULL WHERE id=?",
-                (start_iso, end_iso, tz_name, reminder, self.event["id"]),
+                "UPDATE events SET start_time=?, end_time=?, timezone=?, reminder_offset=?, rsvp_cutoff=?, reminded_at=NULL WHERE id=?",
+                (start_iso, end_iso, tz_name, reminder, cutoff_iso, self.event["id"]),
             )
             conn.commit()
 
@@ -540,7 +565,7 @@ class EditEventTimeModal(discord.ui.Modal):
             ml_embed = embed_event_edited(
                 self.event,
                 interaction.user,
-                "Start time, end time, timezone, or reminder offset",
+                "Start time, end time, timezone, reminder offset, or RSVP cutoff",
             )
             await log_event(interaction.client, interaction.guild_id, ml_embed)
         except Exception as e:
@@ -848,6 +873,7 @@ def _insert_event_row(
     is_recurring: int, recur_rule: str, recur_interval: int,
     reminder_offset: int, notify_role_id: int | None,
     notify_role_ids_json: str | None, max_rsvp: int,
+    rsvp_cutoff: str | None = None,
 ) -> int:
     """Insert a new event row and return the new event ID."""
     cursor = conn.execute(
@@ -856,15 +882,15 @@ def _insert_event_row(
             (guild_id, channel_id, creator_id, title, description,
              timezone, start_time, end_time, is_recurring,
              recur_rule, recur_interval, reminder_offset,
-             notify_role_id, notify_role_ids, max_rsvp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             notify_role_id, notify_role_ids, max_rsvp, rsvp_cutoff)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             guild_id, channel_id, creator_id,
             title, description, tz_name,
             start_iso, end_iso,
             is_recurring, recur_rule, recur_interval, reminder_offset,
-            notify_role_id, notify_role_ids_json, max_rsvp,
+            notify_role_id, notify_role_ids_json, max_rsvp, rsvp_cutoff,
         ),
     )
     conn.commit()
@@ -964,6 +990,12 @@ class Events(commands.Cog):
             required=False,
             default=None,
         ),
+        cutoff: discord.Option(
+            str,
+            description="RSVP cutoff date & time — signups close after this (optional). e.g. 2026-07-04 19:00",
+            required=False,
+            default=None,
+        ),
     ):
         # ── Guards ────────────────────────────────────────────────────────
         if not check_setup(ctx.guild.id):
@@ -1024,6 +1056,18 @@ class Events(commands.Cog):
         notify_role_ids_json      = json.dumps(role_ids) if role_ids else None
         notify_role_id_legacy     = role_ids[0] if role_ids else None
 
+        # ── RSVP cutoff (optional) ────────────────────────────────────────
+        cutoff_iso = None
+        if cutoff:
+            cutoff_dt = _parse_datetime(cutoff, tz_name)
+            if not cutoff_dt:
+                await ctx.followup.send(
+                    embed=build_error_embed("Couldn't parse the RSVP cutoff date/time."),
+                    ephemeral=True,
+                )
+                return
+            cutoff_iso = cutoff_dt.isoformat()
+
         # ── Insert into DB ────────────────────────────────────────────────
         with get_connection() as conn:
             event_id = _insert_event_row(
@@ -1033,7 +1077,7 @@ class Events(commands.Cog):
                 start_iso, end_iso,
                 is_recurring, recur_rule, interval, reminder_offset,
                 notify_role_id_legacy, notify_role_ids_json,
-                max(0, max_rsvp),
+                max(0, max_rsvp), cutoff_iso,
             )
 
         event = {
@@ -1053,6 +1097,7 @@ class Events(commands.Cog):
             "notify_role_id":        notify_role_id_legacy,
             "notify_role_ids":       notify_role_ids_json,
             "max_rsvp":              max(0, max_rsvp),
+            "rsvp_cutoff":           cutoff_iso,
             "btn_accept_label":      "✅ Accept",
             "btn_decline_label":     "❌ Decline",
             "btn_tentative_label":   "❓ Tentative",

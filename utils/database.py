@@ -76,6 +76,7 @@ def init_db():
             btn_decline_label     TEXT    DEFAULT '❌ Decline',
             btn_tentative_enabled INTEGER DEFAULT 1,
             max_rsvp              INTEGER DEFAULT 0,
+            rsvp_cutoff           TEXT,
             created_at            TEXT    DEFAULT (datetime('now')),
             FOREIGN KEY (guild_id) REFERENCES guild_config(guild_id)
         )
@@ -216,6 +217,15 @@ def init_db():
             log.warning(f"Migration warning (events.notify_role_ids): {e}")
     except Exception as e:
         log.error(f"Unexpected migration error (events.notify_role_ids): {e}")
+
+    # ── Migration: events — rsvp_cutoff ──────────────────────────────────
+    try:
+        cursor.execute("ALTER TABLE events ADD COLUMN rsvp_cutoff TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            log.warning(f"Migration warning (events.rsvp_cutoff): {e}")
+    except Exception as e:
+        log.error(f"Unexpected migration error (events.rsvp_cutoff): {e}")
 
     # ── Migration: events — is_cancelled ──────────────────────────────────
     try:
