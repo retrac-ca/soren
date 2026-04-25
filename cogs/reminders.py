@@ -93,11 +93,12 @@ class Reminders(commands.Cog):
         now_utc     = datetime.now(timezone.utc)
         now_plus_2h = now_utc + timedelta(hours=2)
 
-        # ── Archive threads for events that have ended ────────────────────
+        # ── Archive threads for ended non-recurring events ────────────────
+        # Recurring events are handled by the advancement pass below.
         with get_connection() as conn:
             threaded = conn.execute(
                 "SELECT id, thread_id, end_time, start_time FROM events "
-                "WHERE thread_id IS NOT NULL AND thread_archived = 0"
+                "WHERE thread_id IS NOT NULL AND thread_archived = 0 AND is_recurring = 0"
             ).fetchall()
 
         for trow in threaded:
@@ -126,6 +127,84 @@ class Reminders(commands.Cog):
                     log.info(f"Archived thread {tev['thread_id']} for ended event {tev['id']}")
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"reminder_loop: could not archive thread {tev['thread_id']} for event {tev['id']}: {e}")
+
+        # ── Advance recurring events whose current occurrence has ended ──────
+        with get_connection() as conn:
+            recurring = conn.execute(
+                "SELECT * FROM events WHERE is_recurring=1 AND reminded_at IS NOT NULL AND is_cancelled=0"
+            ).fetchall()
+
+        for row in recurring:
+            event    = dict(row)
+            event_id = event["id"]
+
+            # Determine when this occurrence ends; fall back to start_time if no end_time
+            end_str = event.get("end_time") or event.get("start_time")
+            if not end_str:
+                continue
+            try:
+                end_dt = datetime.fromisoformat(end_str)
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                else:
+                    end_dt = end_dt.astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                continue
+
+            if now_utc < end_dt:
+                continue
+
+            # Occurrence has ended — compute the next one
+            next_start = compute_next_start(
+                event["start_time"], event["recur_rule"], event.get("recur_interval", 1)
+            )
+            if next_start:
+                # Carry the duration forward so end_time stays accurate each occurrence
+                new_end = None
+                if event.get("end_time"):
+                    try:
+                        orig_start = datetime.fromisoformat(event["start_time"])
+                        orig_end   = datetime.fromisoformat(event["end_time"])
+                        if orig_start.tzinfo is None:
+                            orig_start = orig_start.replace(tzinfo=timezone.utc)
+                        if orig_end.tzinfo is None:
+                            orig_end = orig_end.replace(tzinfo=timezone.utc)
+                        duration       = orig_end - orig_start
+                        next_start_dt  = datetime.fromisoformat(next_start)
+                        if next_start_dt.tzinfo is None:
+                            next_start_dt = next_start_dt.replace(tzinfo=timezone.utc)
+                        new_end = (next_start_dt + duration).isoformat()
+                    except (ValueError, TypeError):
+                        pass
+
+                with get_connection() as conn:
+                    if new_end:
+                        conn.execute(
+                            "UPDATE events SET start_time=?, end_time=?, reminded_at=NULL WHERE id=?",
+                            (next_start, new_end, event_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE events SET start_time=?, reminded_at=NULL WHERE id=?",
+                            (next_start, event_id),
+                        )
+                    conn.commit()
+                log.info(f"Advanced recurring event {event_id} to next occurrence: {next_start}")
+                await repost_recurring_embed(self.bot, event_id)
+            else:
+                # Series is complete — archive the thread if one is still open
+                log.info(f"No more occurrences for recurring event {event_id}")
+                if event.get("thread_id") and not event.get("thread_archived"):
+                    with get_connection() as conn:
+                        conn.execute("UPDATE events SET thread_archived=1 WHERE id=?", (event_id,))
+                        conn.commit()
+                    try:
+                        thread = self.bot.get_channel(event["thread_id"]) or await self.bot.fetch_channel(event["thread_id"])
+                        if thread:
+                            await thread.edit(archived=True)
+                            log.info(f"Archived thread {event['thread_id']} for completed recurring event {event_id}")
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                        log.warning(f"reminder_loop: could not archive thread for event {event_id}: {e}")
 
         with get_connection() as conn:
             events = conn.execute(
@@ -193,23 +272,6 @@ class Reminders(commands.Cog):
 
             log.info(f"Sending reminder for event {event_id}: {event['title']}")
             await self._send_reminder(event)
-
-            # Advance recurring events and repost embed
-            if event.get("is_recurring") and event.get("recur_rule"):
-                next_start = compute_next_start(
-                    event["start_time"], event["recur_rule"], event.get("recur_interval", 1)
-                )
-                if next_start:
-                    with get_connection() as conn:
-                        conn.execute(
-                            "UPDATE events SET start_time=?, reminded_at=NULL WHERE id=?",
-                            (next_start, event_id),
-                        )
-                        conn.commit()
-                    log.info(f"Advanced recurring event {event_id} to next occurrence: {next_start}")
-                    await repost_recurring_embed(self.bot, event_id)
-                else:
-                    log.info(f"No more occurrences for recurring event {event_id}")
 
     @reminder_loop.before_loop
     async def before_reminder_loop(self):
