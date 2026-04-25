@@ -159,35 +159,37 @@ class Reminders(commands.Cog):
                 event["start_time"], event["recur_rule"], event.get("recur_interval", 1)
             )
             if next_start:
-                # Carry the duration forward so end_time stays accurate each occurrence
-                new_end = None
-                if event.get("end_time"):
-                    try:
-                        orig_start = datetime.fromisoformat(event["start_time"])
-                        orig_end   = datetime.fromisoformat(event["end_time"])
-                        if orig_start.tzinfo is None:
-                            orig_start = orig_start.replace(tzinfo=timezone.utc)
+                # Carry end_time and rsvp_cutoff forward relative to the new start
+                new_end    = None
+                new_cutoff = None
+                try:
+                    orig_start    = datetime.fromisoformat(event["start_time"])
+                    next_start_dt = datetime.fromisoformat(next_start)
+                    if orig_start.tzinfo is None:
+                        orig_start = orig_start.replace(tzinfo=timezone.utc)
+                    if next_start_dt.tzinfo is None:
+                        next_start_dt = next_start_dt.replace(tzinfo=timezone.utc)
+
+                    if event.get("end_time"):
+                        orig_end = datetime.fromisoformat(event["end_time"])
                         if orig_end.tzinfo is None:
                             orig_end = orig_end.replace(tzinfo=timezone.utc)
-                        duration       = orig_end - orig_start
-                        next_start_dt  = datetime.fromisoformat(next_start)
-                        if next_start_dt.tzinfo is None:
-                            next_start_dt = next_start_dt.replace(tzinfo=timezone.utc)
-                        new_end = (next_start_dt + duration).isoformat()
-                    except (ValueError, TypeError):
-                        pass
+                        new_end = (next_start_dt + (orig_end - orig_start)).isoformat()
+
+                    if event.get("rsvp_cutoff"):
+                        orig_cutoff = datetime.fromisoformat(event["rsvp_cutoff"])
+                        if orig_cutoff.tzinfo is None:
+                            orig_cutoff = orig_cutoff.replace(tzinfo=timezone.utc)
+                        new_cutoff = (next_start_dt + (orig_cutoff - orig_start)).isoformat()
+
+                except (ValueError, TypeError):
+                    pass
 
                 with get_connection() as conn:
-                    if new_end:
-                        conn.execute(
-                            "UPDATE events SET start_time=?, end_time=?, reminded_at=NULL WHERE id=?",
-                            (next_start, new_end, event_id),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE events SET start_time=?, reminded_at=NULL WHERE id=?",
-                            (next_start, event_id),
-                        )
+                    conn.execute(
+                        "UPDATE events SET start_time=?, end_time=?, rsvp_cutoff=?, reminded_at=NULL WHERE id=?",
+                        (next_start, new_end, new_cutoff, event_id),
+                    )
                     conn.commit()
                 log.info(f"Advanced recurring event {event_id} to next occurrence: {next_start}")
                 await repost_recurring_embed(self.bot, event_id)
