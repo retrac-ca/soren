@@ -313,21 +313,49 @@ async def repost_recurring_embed(bot: discord.Bot, event_id: int):
     if not channel:
         return
 
-    # Archive the old discussion thread before deleting the message
+    # Close the old occurrence — disable buttons and mark as ended in-place
+    if event.get("message_id"):
+        try:
+            old_msg = await channel.fetch_message(event["message_id"])
+
+            closed_view = discord.ui.View(timeout=None)
+            closed_view.add_item(discord.ui.Button(
+                label=event.get("btn_accept_label") or "✅ Accept",
+                style=discord.ButtonStyle.success,
+                disabled=True,
+            ))
+            if event.get("btn_tentative_enabled", 1):
+                closed_view.add_item(discord.ui.Button(
+                    label=event.get("btn_tentative_label") or "❓ Tentative",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=True,
+                ))
+            closed_view.add_item(discord.ui.Button(
+                label=event.get("btn_decline_label") or "❌ Decline",
+                style=discord.ButtonStyle.danger,
+                disabled=True,
+            ))
+
+            if old_msg.embeds:
+                ended_embed = old_msg.embeds[0]
+                ended_embed.add_field(
+                    name="🔒 Event Ended",
+                    value="RSVP for this occurrence is now closed.",
+                    inline=False,
+                )
+                await old_msg.edit(embed=ended_embed, view=closed_view)
+            else:
+                await old_msg.edit(view=closed_view)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"repost_recurring_embed: could not close old message for event {event_id}: {e}")
+
+    # Archive the old discussion thread
     if event.get("thread_id"):
         try:
             old_thread = guild.get_thread(event["thread_id"]) or await guild.fetch_channel(event["thread_id"])
             if old_thread:
                 await old_thread.edit(archived=True)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-
-    # Delete the old embed
-    if event.get("message_id"):
-        try:
-            old_msg = await channel.fetch_message(event["message_id"])
-            await old_msg.delete()
-        except (discord.NotFound, discord.Forbidden):
             pass
 
     # Post a fresh embed — ping roles first so the mention appears above the embed
